@@ -31,12 +31,13 @@ async def resolve_video(req: ResolveRequest):
     if any(b in url.lower() for b in blocked):
         raise HTTPException(status_code=403, detail="YouTube non supporte")
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "format": "best[ext=mp4]/best",
-        "socket_timeout": 30,
-    }
+    "quiet": True,
+    "no_warnings": True,
+    "skip_download": True,
+    "format": "best[ext=mp4]/best",
+    "socket_timeout": 30,
+    "cookiefile": "tiktok.com_cookies.txt",
+}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
