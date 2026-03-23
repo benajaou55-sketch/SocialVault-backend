@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
 import uvicorn
+import httpx
+import re
 
 app = FastAPI()
 
@@ -24,20 +26,66 @@ def root():
 def health():
     return {"status": "ok"}
 
+async def resolve_tiktok(url: str) -> dict:
+    try:
+        api_url = f"https://tikwm.com/api/?url={url}&hd=1"
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(api_url)
+            data = response.json()
+        
+        if data.get("code") == 0:
+            video_data = data.get("data", {})
+            play_url = video_data.get("hdplay") or video_data.get("play")
+            if play_url:
+                return {
+                    "success": True,
+                    "direct_url": play_url,
+                    "title": video_data.get("title", "TikTok Video"),
+                    "thumbnail": video_data.get("cover", ""),
+                    "duration": video_data.get("duration", 0),
+                    "platform": "tiktok",
+                    "ext": "mp4"
+                }
+    except Exception as e:
+        pass
+    
+    try:
+        api_url2 = f"https://api.tikmate.app/api/lookup?url={url}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(api_url2, data={"url": url})
+            data2 = resp.json()
+        if data2.get("success"):
+            return {
+                "success": True,
+                "direct_url": data2.get("download_url", ""),
+                "title": data2.get("desc", "TikTok Video"),
+                "thumbnail": data2.get("cover", ""),
+                "duration": 0,
+                "platform": "tiktok",
+                "ext": "mp4"
+            }
+    except Exception as e:
+        pass
+
+    return {"success": False, "error": "Impossible de resoudre cette video TikTok"}
+
 @app.post("/resolve")
 async def resolve_video(req: ResolveRequest):
     url = req.url.strip()
     blocked = ["youtube.com", "youtu.be"]
     if any(b in url.lower() for b in blocked):
         raise HTTPException(status_code=403, detail="YouTube non supporte")
+
+    if "tiktok.com" in url.lower() or "tiktok" in url.lower():
+        return await resolve_tiktok(url)
+
     ydl_opts = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-    "format": "best[ext=mp4]/best",
-    "socket_timeout": 30,
-    "cookiefile": "tiktok.com_cookies.txt",
-}
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "format": "best[ext=mp4]/best",
+        "socket_timeout": 30,
+    }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -71,3 +119,14 @@ async def resolve_video(req: ResolveRequest):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+---
+
+## 🟢 Mettre à jour requirements.txt aussi
+```
+fastapi==0.110.0
+uvicorn==0.29.0
+yt-dlp
+pydantic==2.6.4
+httpx==0.27.0
