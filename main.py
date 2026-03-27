@@ -61,7 +61,8 @@ async def resolve_tiktok(url: str) -> dict:
                     "thumbnail": video_data.get("cover", ""),
                     "duration": video_data.get("duration", 0),
                     "platform": "tiktok",
-                    "ext": "mp4"
+                    "ext": "mp4",
+                    "is_image": False
                 }
     except Exception:
         pass
@@ -79,7 +80,8 @@ async def resolve_tiktok(url: str) -> dict:
                 "thumbnail": data2.get("cover", ""),
                 "duration": 0,
                 "platform": "tiktok",
-                "ext": "mp4"
+                "ext": "mp4",
+                "is_image": False
             }
     except Exception:
         pass
@@ -100,6 +102,9 @@ async def resolve_twitter(url: str) -> dict:
             tweet = data.get("tweet", {})
             media = tweet.get("media", {})
             videos = media.get("videos", [])
+            photos = media.get("photos", [])
+
+            # Priorite aux videos
             if videos:
                 best_video = max(videos, key=lambda v: v.get("width", 0))
                 video_url = best_video.get("url", "")
@@ -111,11 +116,28 @@ async def resolve_twitter(url: str) -> dict:
                         "thumbnail": tweet.get("thumbnail_url", ""),
                         "duration": 0,
                         "platform": "twitter",
-                        "ext": "mp4"
+                        "ext": "mp4",
+                        "is_image": False
                     }
+
+            # Sinon photos
+            if photos:
+                photo_url = photos[0].get("url", "")
+                if photo_url:
+                    return {
+                        "success": True,
+                        "direct_url": photo_url,
+                        "title": tweet.get("text", "Photo X")[:100],
+                        "thumbnail": photo_url,
+                        "duration": 0,
+                        "platform": "twitter",
+                        "ext": "jpg",
+                        "is_image": True
+                    }
+
             return {
                 "success": False,
-                "error": "Ce tweet ne contient pas de video"
+                "error": "Ce tweet ne contient pas de media"
             }
     except Exception:
         pass
@@ -139,11 +161,23 @@ async def resolve_twitter(url: str) -> dict:
                     "thumbnail": data.get("tweetThumbnailUrl", ""),
                     "duration": 0,
                     "platform": "twitter",
-                    "ext": "mp4"
+                    "ext": "mp4",
+                    "is_image": False
+                }
+            elif media.get("type") == "image":
+                return {
+                    "success": True,
+                    "direct_url": media.get("url", ""),
+                    "title": data.get("text", "Photo X")[:100],
+                    "thumbnail": media.get("url", ""),
+                    "duration": 0,
+                    "platform": "twitter",
+                    "ext": "jpg",
+                    "is_image": True
                 }
         return {
             "success": False,
-            "error": "Ce tweet ne contient pas de video"
+            "error": "Ce tweet ne contient pas de media"
         }
     except Exception:
         pass
@@ -164,15 +198,58 @@ async def resolve_twitter(url: str) -> dict:
                         "thumbnail": "",
                         "duration": 0,
                         "platform": "twitter",
-                        "ext": "mp4"
+                        "ext": "mp4",
+                        "is_image": False
                     }
     except Exception:
         pass
 
     return {
         "success": False,
-        "error": "Impossible de telecharger cette video X. Verifiez que le tweet est public et contient une video."
+        "error": "Impossible de telecharger ce media X. Verifiez que le tweet est public."
     }
+
+async def resolve_instagram(url: str) -> dict:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "format": "best",
+        "socket_timeout": 30,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            ext = info.get("ext", "mp4")
+            is_image = ext in ["jpg", "jpeg", "png", "webp"]
+
+            direct_url = info.get("url", "")
+            if not direct_url and info.get("formats"):
+                formats = info["formats"]
+                if is_image:
+                    direct_url = formats[-1].get("url", "")
+                else:
+                    mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
+                    direct_url = mp4_formats[-1]["url"] if mp4_formats else formats[-1].get("url", "")
+
+            return {
+                "success": True,
+                "direct_url": direct_url,
+                "title": info.get("title", "Media Instagram"),
+                "thumbnail": info.get("thumbnail", ""),
+                "duration": int(info.get("duration") or 0),
+                "platform": "instagram",
+                "ext": ext,
+                "is_image": is_image
+            }
+    except Exception as e:
+        error_msg = str(e)
+        if "login" in error_msg.lower():
+            return {"success": False, "error": "Connexion Instagram requise pour ce contenu."}
+        elif "private" in error_msg.lower():
+            return {"success": False, "error": "Ce contenu Instagram est prive."}
+        else:
+            return {"success": False, "error": f"Erreur Instagram: {error_msg[:150]}"}
 
 @app.post("/resolve")
 async def resolve_video(req: ResolveRequest):
@@ -188,6 +265,9 @@ async def resolve_video(req: ResolveRequest):
     if "twitter.com" in url.lower() or "x.com" in url.lower() or "t.co" in url.lower():
         return await resolve_twitter(url)
 
+    if "instagram.com" in url.lower():
+        return await resolve_instagram(url)
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -198,6 +278,8 @@ async def resolve_video(req: ResolveRequest):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            ext = info.get("ext", "mp4")
+            is_image = ext in ["jpg", "jpeg", "png", "webp"]
             direct_url = ""
             if "url" in info:
                 direct_url = info["url"]
@@ -217,14 +299,23 @@ async def resolve_video(req: ResolveRequest):
             return {
                 "success": True,
                 "direct_url": direct_url,
-                "title": info.get("title", "Video sans titre"),
+                "title": info.get("title", "Media sans titre"),
                 "thumbnail": info.get("thumbnail", ""),
                 "duration": int(info.get("duration") or 0),
                 "platform": platform,
-                "ext": info.get("ext", "mp4")
+                "ext": ext,
+                "is_image": is_image
             }
     except Exception as e:
-        return {"success": False, "error": str(e)[:200]}
+        error_msg = str(e)
+        if "private" in error_msg.lower():
+            return {"success": False, "error": "Ce contenu est prive ou inaccessible."}
+        elif "login" in error_msg.lower():
+            return {"success": False, "error": "Connexion requise pour acceder a ce contenu."}
+        elif "not found" in error_msg.lower():
+            return {"success": False, "error": "Contenu introuvable ou supprime."}
+        else:
+            return {"success": False, "error": error_msg[:200]}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
