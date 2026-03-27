@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import yt_dlp
 import uvicorn
 import httpx
+import re
 
 app = FastAPI()
 
@@ -53,19 +54,16 @@ async def resolve_tiktok(url: str) -> dict:
             video_data = data.get("data", {})
             play_url = video_data.get("hdplay") or video_data.get("play")
             if play_url:
-                encoded_url = httpx.URL(play_url)
-                download_url = f"/download?url={play_url}"
                 return {
                     "success": True,
                     "direct_url": play_url,
-                    "download_via_backend": True,
                     "title": video_data.get("title", "TikTok Video"),
                     "thumbnail": video_data.get("cover", ""),
                     "duration": video_data.get("duration", 0),
                     "platform": "tiktok",
                     "ext": "mp4"
                 }
-    except Exception as e:
+    except Exception:
         pass
 
     try:
@@ -77,27 +75,118 @@ async def resolve_tiktok(url: str) -> dict:
             return {
                 "success": True,
                 "direct_url": data2.get("download_url", ""),
-                "download_via_backend": True,
                 "title": data2.get("desc", "TikTok Video"),
                 "thumbnail": data2.get("cover", ""),
                 "duration": 0,
                 "platform": "tiktok",
                 "ext": "mp4"
             }
-    except Exception as e:
+    except Exception:
         pass
 
     return {"success": False, "error": "Impossible de resoudre cette video TikTok"}
 
+async def resolve_twitter(url: str) -> dict:
+    try:
+        tweet_id = url.rstrip("/").split("/")[-1].split("?")[0]
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"https://api.fxtwitter.com/status/{tweet_id}",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            data = response.json()
+
+        if data.get("code") == 200:
+            tweet = data.get("tweet", {})
+            media = tweet.get("media", {})
+            videos = media.get("videos", [])
+            if videos:
+                best_video = max(videos, key=lambda v: v.get("width", 0))
+                video_url = best_video.get("url", "")
+                if video_url:
+                    return {
+                        "success": True,
+                        "direct_url": video_url,
+                        "title": tweet.get("text", "Video X")[:100],
+                        "thumbnail": tweet.get("thumbnail_url", ""),
+                        "duration": 0,
+                        "platform": "twitter",
+                        "ext": "mp4"
+                    }
+            return {
+                "success": False,
+                "error": "Ce tweet ne contient pas de video"
+            }
+    except Exception:
+        pass
+
+    try:
+        tweet_id = url.rstrip("/").split("/")[-1].split("?")[0]
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"https://api.vxtwitter.com/status/{tweet_id}",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            data = response.json()
+
+        media_urls = data.get("media_extended", [])
+        for media in media_urls:
+            if media.get("type") == "video":
+                return {
+                    "success": True,
+                    "direct_url": media.get("url", ""),
+                    "title": data.get("text", "Video X")[:100],
+                    "thumbnail": data.get("tweetThumbnailUrl", ""),
+                    "duration": 0,
+                    "platform": "twitter",
+                    "ext": "mp4"
+                }
+        return {
+            "success": False,
+            "error": "Ce tweet ne contient pas de video"
+        }
+    except Exception:
+        pass
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"https://twitsave.com/info?url={url}",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            if response.status_code == 200:
+                urls = re.findall(r'https://[^"]*\.mp4[^"]*', response.text)
+                if urls:
+                    return {
+                        "success": True,
+                        "direct_url": urls[0],
+                        "title": "Video X",
+                        "thumbnail": "",
+                        "duration": 0,
+                        "platform": "twitter",
+                        "ext": "mp4"
+                    }
+    except Exception:
+        pass
+
+    return {
+        "success": False,
+        "error": "Impossible de telecharger cette video X. Verifiez que le tweet est public et contient une video."
+    }
+
 @app.post("/resolve")
 async def resolve_video(req: ResolveRequest):
     url = req.url.strip()
+
     blocked = ["youtube.com", "youtu.be"]
     if any(b in url.lower() for b in blocked):
         raise HTTPException(status_code=403, detail="YouTube non supporte")
 
     if "tiktok.com" in url.lower() or "tiktok" in url.lower():
         return await resolve_tiktok(url)
+
+    if "twitter.com" in url.lower() or "x.com" in url.lower() or "t.co" in url.lower():
+        return await resolve_twitter(url)
 
     ydl_opts = {
         "quiet": True,
@@ -119,7 +208,7 @@ async def resolve_video(req: ResolveRequest):
                 else:
                     direct_url = info["formats"][-1].get("url", "")
             if not direct_url:
-                return {"success": False, "error": "Impossible de resoudre URL"}
+                return {"success": False, "error": "Impossible de resoudre cette URL"}
             platform = "unknown"
             for p in ["facebook", "instagram", "tiktok", "twitter", "x.com"]:
                 if p in url.lower():
@@ -128,7 +217,6 @@ async def resolve_video(req: ResolveRequest):
             return {
                 "success": True,
                 "direct_url": direct_url,
-                "download_via_backend": False,
                 "title": info.get("title", "Video sans titre"),
                 "thumbnail": info.get("thumbnail", ""),
                 "duration": int(info.get("duration") or 0),
