@@ -52,6 +52,23 @@ async def resolve_tiktok(url: str) -> dict:
             data = response.json()
         if data.get("code") == 0:
             video_data = data.get("data", {})
+
+            # Cas diaporama/photos TikTok
+            images = video_data.get("images", [])
+            if images and len(images) > 0:
+                return {
+                    "success": True,
+                    "direct_url": images[0],
+                    "title": video_data.get("title", "TikTok Photo"),
+                    "thumbnail": images[0],
+                    "duration": 0,
+                    "platform": "tiktok",
+                    "ext": "jpg",
+                    "is_image": True,
+                    "all_images": images
+                }
+
+            # Cas video normale
             play_url = video_data.get("hdplay") or video_data.get("play")
             if play_url:
                 return {
@@ -253,16 +270,15 @@ async def resolve_instagram(url: str) -> dict:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-            # Cas playlist (stories, carousel)
+            # Cas carousel ou stories (plusieurs medias)
             if info.get("_type") == "playlist":
                 entries = info.get("entries", [])
-                if entries:
-                    info = entries[0]
-                else:
+                if not entries:
                     return {
                         "success": False,
                         "error": "Aucun media trouve dans ce contenu Instagram."
                     }
+                info = entries[0]
 
             ext = info.get("ext", "mp4")
             is_image = ext in ["jpg", "jpeg", "png", "webp"]
@@ -282,7 +298,7 @@ async def resolve_instagram(url: str) -> dict:
             if not direct_url:
                 return {
                     "success": False,
-                    "error": "Impossible d'extraire ce contenu Instagram. Il est peut-etre prive."
+                    "error": "Impossible d'extraire ce contenu. Il est peut-etre prive ou une connexion est requise."
                 }
 
             return {
@@ -303,20 +319,68 @@ async def resolve_instagram(url: str) -> dict:
                 "error": "Ce contenu Instagram necessite une connexion. Seuls les contenus publics sont supportes."
             }
         elif "private" in error_msg.lower():
-            return {
-                "success": False,
-                "error": "Ce contenu Instagram est prive."
-            }
+            return {"success": False, "error": "Ce contenu Instagram est prive."}
         elif "story" in error_msg.lower():
             return {
                 "success": False,
-                "error": "Les stories Instagram expirent rapidement. Reessayez immediatement apres le partage."
+                "error": "Les stories Instagram expirent et necessitent une connexion."
             }
         else:
+            return {"success": False, "error": f"Erreur Instagram: {error_msg[:150]}"}
+
+async def resolve_facebook(url: str) -> dict:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "format": "best[ext=mp4]/best",
+        "socket_timeout": 30,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            if info.get("_type") == "playlist":
+                entries = info.get("entries", [])
+                if entries:
+                    info = entries[0]
+
+            ext = info.get("ext", "mp4")
+            is_image = ext in ["jpg", "jpeg", "png", "webp"]
+            direct_url = info.get("url", "")
+
+            if not direct_url and info.get("formats"):
+                formats = info["formats"]
+                mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
+                direct_url = mp4_formats[-1]["url"] if mp4_formats else formats[-1].get("url", "")
+
+            if not direct_url:
+                return {
+                    "success": False,
+                    "error": "Impossible d'extraire ce contenu Facebook. Il est peut-etre prive."
+                }
+
+            return {
+                "success": True,
+                "direct_url": direct_url,
+                "title": info.get("title", "Video Facebook"),
+                "thumbnail": info.get("thumbnail", ""),
+                "duration": int(info.get("duration") or 0),
+                "platform": "facebook",
+                "ext": ext,
+                "is_image": is_image
+            }
+    except Exception as e:
+        error_msg = str(e)
+        if "login" in error_msg.lower() or "cookie" in error_msg.lower():
             return {
                 "success": False,
-                "error": f"Erreur Instagram: {error_msg[:150]}"
+                "error": "Ce contenu Facebook necessite une connexion. Seuls les contenus publics sont supportes."
             }
+        elif "private" in error_msg.lower():
+            return {"success": False, "error": "Ce contenu Facebook est prive."}
+        else:
+            return {"success": False, "error": f"Erreur Facebook: {error_msg[:150]}"}
 
 @app.post("/resolve")
 async def resolve_video(req: ResolveRequest):
@@ -336,6 +400,9 @@ async def resolve_video(req: ResolveRequest):
 
     if "instagram.com" in url.lower():
         return await resolve_instagram(url)
+
+    if "facebook.com" in url.lower() or "fb.watch" in url.lower() or "fb.com" in url.lower():
+        return await resolve_facebook(url)
 
     ydl_opts = {
         "quiet": True,
