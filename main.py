@@ -79,7 +79,8 @@ async def resolve_tiktok(url: str) -> dict:
                     "duration": video_data.get("duration", 0),
                     "platform": "tiktok",
                     "ext": "mp4",
-                    "is_image": False
+                    "is_image": False,
+                    "all_images": []
                 }
     except Exception:
         pass
@@ -98,7 +99,8 @@ async def resolve_tiktok(url: str) -> dict:
                 "duration": 0,
                 "platform": "tiktok",
                 "ext": "mp4",
-                "is_image": False
+                "is_image": False,
+                "all_images": []
             }
     except Exception:
         pass
@@ -130,7 +132,8 @@ async def resolve_tiktok_story(url: str) -> dict:
                     "duration": int(info.get("duration") or 0),
                     "platform": "tiktok",
                     "ext": ext,
-                    "is_image": is_image
+                    "is_image": is_image,
+                    "all_images": []
                 }
     except Exception:
         pass
@@ -167,7 +170,8 @@ async def resolve_twitter(url: str) -> dict:
                         "duration": 0,
                         "platform": "twitter",
                         "ext": "mp4",
-                        "is_image": False
+                        "is_image": False,
+                        "all_images": []
                     }
 
             if photos:
@@ -181,7 +185,8 @@ async def resolve_twitter(url: str) -> dict:
                         "duration": 0,
                         "platform": "twitter",
                         "ext": "jpg",
-                        "is_image": True
+                        "is_image": True,
+                        "all_images": []
                     }
 
             return {
@@ -211,7 +216,8 @@ async def resolve_twitter(url: str) -> dict:
                     "duration": 0,
                     "platform": "twitter",
                     "ext": "mp4",
-                    "is_image": False
+                    "is_image": False,
+                    "all_images": []
                 }
             elif media.get("type") == "image":
                 return {
@@ -222,7 +228,8 @@ async def resolve_twitter(url: str) -> dict:
                     "duration": 0,
                     "platform": "twitter",
                     "ext": "jpg",
-                    "is_image": True
+                    "is_image": True,
+                    "all_images": []
                 }
         return {
             "success": False,
@@ -248,7 +255,8 @@ async def resolve_twitter(url: str) -> dict:
                         "duration": 0,
                         "platform": "twitter",
                         "ext": "mp4",
-                        "is_image": False
+                        "is_image": False,
+                        "all_images": []
                     }
     except Exception:
         pass
@@ -265,40 +273,38 @@ async def resolve_instagram(url: str) -> dict:
         "skip_download": True,
         "format": "best",
         "socket_timeout": 30,
+        "extract_flat": False,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-            # Cas carousel ou stories (plusieurs medias)
             if info.get("_type") == "playlist":
                 entries = info.get("entries", [])
-                if not entries:
+                valid_entries = [e for e in entries if e and (e.get("url") or e.get("formats"))]
+                if not valid_entries:
                     return {
                         "success": False,
-                        "error": "Aucun media trouve dans ce contenu Instagram."
+                        "error": "Aucun media public trouve. Ce contenu necessite peut-etre une connexion."
                     }
-                info = entries[0]
+                info = valid_entries[0]
 
             ext = info.get("ext", "mp4")
             is_image = ext in ["jpg", "jpeg", "png", "webp"]
 
             direct_url = info.get("url", "")
             if not direct_url and info.get("formats"):
-                formats = info["formats"]
+                formats = [f for f in info["formats"] if f.get("url")]
                 if is_image:
-                    direct_url = formats[-1].get("url", "")
+                    direct_url = formats[-1].get("url", "") if formats else ""
                 else:
-                    mp4_formats = [
-                        f for f in formats
-                        if f.get("ext") == "mp4" and f.get("url")
-                    ]
-                    direct_url = mp4_formats[-1]["url"] if mp4_formats else formats[-1].get("url", "")
+                    mp4_formats = [f for f in formats if f.get("ext") == "mp4"]
+                    direct_url = mp4_formats[-1]["url"] if mp4_formats else (formats[-1].get("url", "") if formats else "")
 
             if not direct_url:
                 return {
                     "success": False,
-                    "error": "Impossible d'extraire ce contenu. Il est peut-etre prive ou une connexion est requise."
+                    "error": "Impossible d'extraire ce contenu. Il est peut-etre prive ou necessite une connexion."
                 }
 
             return {
@@ -309,7 +315,8 @@ async def resolve_instagram(url: str) -> dict:
                 "duration": int(info.get("duration") or 0),
                 "platform": "instagram",
                 "ext": ext,
-                "is_image": is_image
+                "is_image": is_image,
+                "all_images": []
             }
     except Exception as e:
         error_msg = str(e)
@@ -320,11 +327,6 @@ async def resolve_instagram(url: str) -> dict:
             }
         elif "private" in error_msg.lower():
             return {"success": False, "error": "Ce contenu Instagram est prive."}
-        elif "story" in error_msg.lower():
-            return {
-                "success": False,
-                "error": "Les stories Instagram expirent et necessitent une connexion."
-            }
         else:
             return {"success": False, "error": f"Erreur Instagram: {error_msg[:150]}"}
 
@@ -368,7 +370,8 @@ async def resolve_facebook(url: str) -> dict:
                 "duration": int(info.get("duration") or 0),
                 "platform": "facebook",
                 "ext": ext,
-                "is_image": is_image
+                "is_image": is_image,
+                "all_images": []
             }
     except Exception as e:
         error_msg = str(e)
@@ -443,7 +446,8 @@ async def resolve_video(req: ResolveRequest):
                 "duration": int(info.get("duration") or 0),
                 "platform": platform,
                 "ext": ext,
-                "is_image": is_image
+                "is_image": is_image,
+                "all_images": []
             }
     except Exception as e:
         error_msg = str(e)
