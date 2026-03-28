@@ -88,6 +88,40 @@ async def resolve_tiktok(url: str) -> dict:
 
     return {"success": False, "error": "Impossible de resoudre cette video TikTok"}
 
+async def resolve_tiktok_story(url: str) -> dict:
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "best",
+            "socket_timeout": 30,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            ext = info.get("ext", "mp4")
+            is_image = ext in ["jpg", "jpeg", "png", "webp"]
+            direct_url = info.get("url", "")
+            if not direct_url and info.get("formats"):
+                direct_url = info["formats"][-1].get("url", "")
+            if direct_url:
+                return {
+                    "success": True,
+                    "direct_url": direct_url,
+                    "title": info.get("title", "TikTok Story"),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "duration": int(info.get("duration") or 0),
+                    "platform": "tiktok",
+                    "ext": ext,
+                    "is_image": is_image
+                }
+    except Exception:
+        pass
+    return {
+        "success": False,
+        "error": "Impossible de telecharger cette story TikTok."
+    }
+
 async def resolve_twitter(url: str) -> dict:
     try:
         tweet_id = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -104,7 +138,6 @@ async def resolve_twitter(url: str) -> dict:
             videos = media.get("videos", [])
             photos = media.get("photos", [])
 
-            # Priorite aux videos
             if videos:
                 best_video = max(videos, key=lambda v: v.get("width", 0))
                 video_url = best_video.get("url", "")
@@ -120,7 +153,6 @@ async def resolve_twitter(url: str) -> dict:
                         "is_image": False
                     }
 
-            # Sinon photos
             if photos:
                 photo_url = photos[0].get("url", "")
                 if photo_url:
@@ -137,7 +169,7 @@ async def resolve_twitter(url: str) -> dict:
 
             return {
                 "success": False,
-                "error": "Ce tweet ne contient pas de media"
+                "error": "Ce tweet ne contient pas de media (video ou photo)"
             }
     except Exception:
         pass
@@ -220,6 +252,18 @@ async def resolve_instagram(url: str) -> dict:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+
+            # Cas playlist (stories, carousel)
+            if info.get("_type") == "playlist":
+                entries = info.get("entries", [])
+                if entries:
+                    info = entries[0]
+                else:
+                    return {
+                        "success": False,
+                        "error": "Aucun media trouve dans ce contenu Instagram."
+                    }
+
             ext = info.get("ext", "mp4")
             is_image = ext in ["jpg", "jpeg", "png", "webp"]
 
@@ -229,8 +273,17 @@ async def resolve_instagram(url: str) -> dict:
                 if is_image:
                     direct_url = formats[-1].get("url", "")
                 else:
-                    mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
+                    mp4_formats = [
+                        f for f in formats
+                        if f.get("ext") == "mp4" and f.get("url")
+                    ]
                     direct_url = mp4_formats[-1]["url"] if mp4_formats else formats[-1].get("url", "")
+
+            if not direct_url:
+                return {
+                    "success": False,
+                    "error": "Impossible d'extraire ce contenu Instagram. Il est peut-etre prive."
+                }
 
             return {
                 "success": True,
@@ -244,12 +297,26 @@ async def resolve_instagram(url: str) -> dict:
             }
     except Exception as e:
         error_msg = str(e)
-        if "login" in error_msg.lower():
-            return {"success": False, "error": "Connexion Instagram requise pour ce contenu."}
+        if "login" in error_msg.lower() or "cookie" in error_msg.lower():
+            return {
+                "success": False,
+                "error": "Ce contenu Instagram necessite une connexion. Seuls les contenus publics sont supportes."
+            }
         elif "private" in error_msg.lower():
-            return {"success": False, "error": "Ce contenu Instagram est prive."}
+            return {
+                "success": False,
+                "error": "Ce contenu Instagram est prive."
+            }
+        elif "story" in error_msg.lower():
+            return {
+                "success": False,
+                "error": "Les stories Instagram expirent rapidement. Reessayez immediatement apres le partage."
+            }
         else:
-            return {"success": False, "error": f"Erreur Instagram: {error_msg[:150]}"}
+            return {
+                "success": False,
+                "error": f"Erreur Instagram: {error_msg[:150]}"
+            }
 
 @app.post("/resolve")
 async def resolve_video(req: ResolveRequest):
@@ -260,6 +327,8 @@ async def resolve_video(req: ResolveRequest):
         raise HTTPException(status_code=403, detail="YouTube non supporte")
 
     if "tiktok.com" in url.lower() or "tiktok" in url.lower():
+        if "/story/" in url.lower() or "/photo/" in url.lower():
+            return await resolve_tiktok_story(url)
         return await resolve_tiktok(url)
 
     if "twitter.com" in url.lower() or "x.com" in url.lower() or "t.co" in url.lower():
@@ -284,7 +353,10 @@ async def resolve_video(req: ResolveRequest):
             if "url" in info:
                 direct_url = info["url"]
             elif "formats" in info and info["formats"]:
-                mp4_formats = [f for f in info["formats"] if f.get("ext") == "mp4" and f.get("url")]
+                mp4_formats = [
+                    f for f in info["formats"]
+                    if f.get("ext") == "mp4" and f.get("url")
+                ]
                 if mp4_formats:
                     direct_url = mp4_formats[-1]["url"]
                 else:
