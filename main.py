@@ -530,3 +530,4 @@ async def resolve_video(req: ResolveRequest):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    instaloader==4.10.1
