@@ -6,6 +6,7 @@ import yt_dlp
 import uvicorn
 import httpx
 import re
+import os
 
 app = FastAPI()
 
@@ -18,6 +19,20 @@ app.add_middleware(
 
 class ResolveRequest(BaseModel):
     url: str
+
+# Chemins des fichiers cookies
+INSTAGRAM_COOKIES = "instagram_cookies.txt"
+FACEBOOK_COOKIES = "facebook_cookies.txt"
+TIKTOK_COOKIES = "tiktok.com_cookies.txt"
+
+def get_cookie_file(platform: str) -> str | None:
+    if platform == "instagram" and os.path.exists(INSTAGRAM_COOKIES):
+        return INSTAGRAM_COOKIES
+    elif platform == "facebook" and os.path.exists(FACEBOOK_COOKIES):
+        return FACEBOOK_COOKIES
+    elif platform == "tiktok" and os.path.exists(TIKTOK_COOKIES):
+        return TIKTOK_COOKIES
+    return None
 
 @app.get("/")
 def root():
@@ -152,7 +167,6 @@ async def resolve_twitter(url: str) -> dict:
             photos = media.get("photos", [])
             gifs = media.get("gifs", [])
 
-            # Videos
             if videos:
                 best_video = max(videos, key=lambda v: v.get("width", 0))
                 video_url = best_video.get("url", "")
@@ -169,7 +183,6 @@ async def resolve_twitter(url: str) -> dict:
                         "all_images": []
                     }
 
-            # GIFs
             if gifs:
                 gif_url = gifs[0].get("url", "")
                 if gif_url:
@@ -185,7 +198,6 @@ async def resolve_twitter(url: str) -> dict:
                         "all_images": []
                     }
 
-            # Photos
             if photos:
                 photo_url = photos[0].get("url", "")
                 if photo_url:
@@ -243,7 +255,6 @@ async def resolve_twitter(url: str) -> dict:
                     "is_image": True,
                     "all_images": []
                 }
-
         return {
             "success": False,
             "error": "Ce tweet est un tweet texte et ne contient pas de media."
@@ -280,7 +291,8 @@ async def resolve_twitter(url: str) -> dict:
     }
 
 async def resolve_instagram(url: str) -> dict:
-    # Essai 1 — yt-dlp sans cookies
+    # Essai 1 — yt-dlp avec cookies Instagram
+    cookie_file = get_cookie_file("instagram")
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -289,6 +301,12 @@ async def resolve_instagram(url: str) -> dict:
         "socket_timeout": 30,
         "extract_flat": False,
     }
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
+        ydl_opts["http_headers"] = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -327,63 +345,12 @@ async def resolve_instagram(url: str) -> dict:
     except Exception:
         pass
 
-    # Essai 2 — API Instagram publique
-    try:
-        shortcode = url.rstrip("/").split("/")[-1]
-        if not shortcode:
-            parts = url.rstrip("/").split("/")
-            shortcode = parts[-1] if parts else ""
-
-        api_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(api_url, headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
-                "Accept": "application/json"
-            })
-            if resp.status_code == 200:
-                data = resp.json()
-                item = data.get("graphql", {}).get("shortcode_media", {})
-                if not item:
-                    item = data.get("items", [{}])[0] if data.get("items") else {}
-
-                media_type = item.get("media_type", 1)
-                if media_type == 2:  # Video
-                    versions = item.get("video_versions", [])
-                    if versions:
-                        return {
-                            "success": True,
-                            "direct_url": versions[0].get("url", ""),
-                            "title": item.get("caption", {}).get("text", "Video Instagram")[:100] if item.get("caption") else "Video Instagram",
-                            "thumbnail": item.get("image_versions2", {}).get("candidates", [{}])[0].get("url", ""),
-                            "duration": int(item.get("video_duration", 0)),
-                            "platform": "instagram",
-                            "ext": "mp4",
-                            "is_image": False,
-                            "all_images": []
-                        }
-                else:  # Photo
-                    candidates = item.get("image_versions2", {}).get("candidates", [])
-                    if candidates:
-                        return {
-                            "success": True,
-                            "direct_url": candidates[0].get("url", ""),
-                            "title": item.get("caption", {}).get("text", "Photo Instagram")[:100] if item.get("caption") else "Photo Instagram",
-                            "thumbnail": candidates[0].get("url", ""),
-                            "duration": 0,
-                            "platform": "instagram",
-                            "ext": "jpg",
-                            "is_image": True,
-                            "all_images": []
-                        }
-    except Exception:
-        pass
-
-    # Essai 3 — API ddinstagram
+    # Essai 2 — API ddinstagram
     try:
         shortcode = ""
         parts = url.rstrip("/").split("/")
         for i, p in enumerate(parts):
-            if p in ["p", "reel", "tv"]:
+            if p in ["p", "reel", "tv", "stories"]:
                 if i + 1 < len(parts):
                     shortcode = parts[i + 1]
                     break
@@ -426,10 +393,11 @@ async def resolve_instagram(url: str) -> dict:
 
     return {
         "success": False,
-        "error": "Impossible de telecharger ce contenu Instagram. Seuls les contenus publics sont supportes. Les stories et contenus prives necessitent une connexion."
+        "error": "Impossible de telecharger ce contenu Instagram. Verifiez que le contenu est public ou reconnectez-vous."
     }
 
 async def resolve_facebook(url: str) -> dict:
+    cookie_file = get_cookie_file("facebook")
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -437,6 +405,12 @@ async def resolve_facebook(url: str) -> dict:
         "format": "best[ext=mp4]/best",
         "socket_timeout": 30,
     }
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
+        ydl_opts["http_headers"] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -452,7 +426,10 @@ async def resolve_facebook(url: str) -> dict:
                 mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
                 direct_url = mp4_formats[-1]["url"] if mp4_formats else formats[-1].get("url", "")
             if not direct_url:
-                return {"success": False, "error": "Impossible d'extraire ce contenu Facebook. Il est peut-etre prive."}
+                return {
+                    "success": False,
+                    "error": "Impossible d'extraire ce contenu Facebook."
+                }
             return {
                 "success": True,
                 "direct_url": direct_url,
@@ -467,7 +444,10 @@ async def resolve_facebook(url: str) -> dict:
     except Exception as e:
         error_msg = str(e)
         if "login" in error_msg.lower() or "cookie" in error_msg.lower():
-            return {"success": False, "error": "Ce contenu Facebook necessite une connexion. Seuls les contenus publics sont supportes."}
+            return {
+                "success": False,
+                "error": "Ce contenu Facebook necessite une connexion. Seuls les contenus publics et vos propres stories sont supportes."
+            }
         elif "private" in error_msg.lower():
             return {"success": False, "error": "Ce contenu Facebook est prive."}
         else:
@@ -511,7 +491,10 @@ async def resolve_video(req: ResolveRequest):
             if "url" in info:
                 direct_url = info["url"]
             elif "formats" in info and info["formats"]:
-                mp4_formats = [f for f in info["formats"] if f.get("ext") == "mp4" and f.get("url")]
+                mp4_formats = [
+                    f for f in info["formats"]
+                    if f.get("ext") == "mp4" and f.get("url")
+                ]
                 if mp4_formats:
                     direct_url = mp4_formats[-1]["url"]
                 else:
