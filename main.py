@@ -20,12 +20,11 @@ app.add_middleware(
 class ResolveRequest(BaseModel):
     url: str
 
-# Chemins des fichiers cookies
 INSTAGRAM_COOKIES = "instagram_cookies.txt"
 FACEBOOK_COOKIES = "facebook_cookies.txt"
 TIKTOK_COOKIES = "tiktok.com_cookies.txt"
 
-def get_cookie_file(platform: str) -> str | None:
+def get_cookie_file(platform: str):
     if platform == "instagram" and os.path.exists(INSTAGRAM_COOKIES):
         return INSTAGRAM_COOKIES
     elif platform == "facebook" and os.path.exists(FACEBOOK_COOKIES):
@@ -41,6 +40,13 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/check")
+def check_files():
+    files = {}
+    for f in ["instagram_cookies.txt", "facebook_cookies.txt", "tiktok.com_cookies.txt"]:
+        files[f] = os.path.exists(f)
+    return files
 
 @app.get("/download")
 async def download_video(url: str):
@@ -182,7 +188,6 @@ async def resolve_twitter(url: str) -> dict:
                         "is_image": False,
                         "all_images": []
                     }
-
             if gifs:
                 gif_url = gifs[0].get("url", "")
                 if gif_url:
@@ -197,7 +202,6 @@ async def resolve_twitter(url: str) -> dict:
                         "is_image": False,
                         "all_images": []
                     }
-
             if photos:
                 photo_url = photos[0].get("url", "")
                 if photo_url:
@@ -212,7 +216,6 @@ async def resolve_twitter(url: str) -> dict:
                         "is_image": True,
                         "all_images": []
                     }
-
             return {
                 "success": False,
                 "error": "Ce tweet est un tweet texte et ne contient pas de video, photo ou GIF."
@@ -228,7 +231,6 @@ async def resolve_twitter(url: str) -> dict:
                 headers={"User-Agent": "Mozilla/5.0"}
             )
             data = response.json()
-
         media_urls = data.get("media_extended", [])
         for media in media_urls:
             if media.get("type") in ["video", "gif"]:
@@ -290,8 +292,155 @@ async def resolve_twitter(url: str) -> dict:
         "error": "Ce tweet ne contient pas de media ou le contenu est prive."
     }
 
+async def resolve_instagram_photo(url: str) -> dict:
+    """Essaie plusieurs APIs pour extraire les photos Instagram."""
+
+    # Extraire le shortcode
+    shortcode = ""
+    parts = url.rstrip("/").split("/")
+    for i, p in enumerate(parts):
+        if p in ["p", "reel", "tv", "stories"]:
+            if i + 1 < len(parts):
+                shortcode = parts[i + 1].split("?")[0]
+                break
+
+    if not shortcode:
+        return {"success": False, "error": "Lien Instagram invalide."}
+
+    # API 1 — instagramdownloader.io
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://instagramdownloader.io/api/index.php",
+                data={"url": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "X-Requested-With": "XMLHttpRequest"
+                }
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success"):
+                    media = data.get("media", [])
+                    if media:
+                        item = media[0]
+                        direct_url = item.get("url", "")
+                        is_video = item.get("type", "") == "video"
+                        if direct_url:
+                            return {
+                                "success": True,
+                                "direct_url": direct_url,
+                                "title": "Media Instagram",
+                                "thumbnail": direct_url if not is_video else "",
+                                "duration": 0,
+                                "platform": "instagram",
+                                "ext": "mp4" if is_video else "jpg",
+                                "is_image": not is_video,
+                                "all_images": []
+                            }
+    except Exception:
+        pass
+
+    # API 2 — snapinsta
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            token_resp = await client.get(
+                "https://snapinsta.app/",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            token_match = re.search(r'name="_token"\s+value="([^"]+)"', token_resp.text)
+            token = token_match.group(1) if token_match else ""
+
+            if token:
+                dl_resp = await client.post(
+                    "https://snapinsta.app/action.php",
+                    data={"url": url, "_token": token},
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Referer": "https://snapinsta.app/",
+                        "X-Requested-With": "XMLHttpRequest"
+                    }
+                )
+                if dl_resp.status_code == 200:
+                    result = dl_resp.json()
+                    html = result.get("data", "") if isinstance(result, dict) else str(result)
+                    img_urls = re.findall(r'https://[^"\']+\.jpg[^"\']*', html)
+                    vid_urls = re.findall(r'https://[^"\']+\.mp4[^"\']*', html)
+                    if vid_urls:
+                        return {
+                            "success": True,
+                            "direct_url": vid_urls[0],
+                            "title": "Video Instagram",
+                            "thumbnail": img_urls[0] if img_urls else "",
+                            "duration": 0,
+                            "platform": "instagram",
+                            "ext": "mp4",
+                            "is_image": False,
+                            "all_images": []
+                        }
+                    elif img_urls:
+                        return {
+                            "success": True,
+                            "direct_url": img_urls[0],
+                            "title": "Photo Instagram",
+                            "thumbnail": img_urls[0],
+                            "duration": 0,
+                            "platform": "instagram",
+                            "ext": "jpg",
+                            "is_image": True,
+                            "all_images": []
+                        }
+    except Exception:
+        pass
+
+    # API 3 — saveinsta
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://saveinsta.app/api/ajaxSearch",
+                data={"q": url, "t": "media", "lang": "fr"},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://saveinsta.app/",
+                    "X-Requested-With": "XMLHttpRequest"
+                }
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                data_html = result.get("data", "")
+                img_urls = re.findall(r'https://[^"\']+scontent[^"\']+\.jpg[^"\']*', data_html)
+                vid_urls = re.findall(r'https://[^"\']+\.mp4[^"\']*', data_html)
+                if vid_urls:
+                    return {
+                        "success": True,
+                        "direct_url": vid_urls[0],
+                        "title": "Video Instagram",
+                        "thumbnail": img_urls[0] if img_urls else "",
+                        "duration": 0,
+                        "platform": "instagram",
+                        "ext": "mp4",
+                        "is_image": False,
+                        "all_images": []
+                    }
+                elif img_urls:
+                    return {
+                        "success": True,
+                        "direct_url": img_urls[0],
+                        "title": "Photo Instagram",
+                        "thumbnail": img_urls[0],
+                        "duration": 0,
+                        "platform": "instagram",
+                        "ext": "jpg",
+                        "is_image": True,
+                        "all_images": []
+                    }
+    except Exception:
+        pass
+
+    return {"success": False, "error": ""}
+
 async def resolve_instagram(url: str) -> dict:
-    # Essai 1 — yt-dlp avec cookies Instagram
+    # Essai 1 — yt-dlp avec cookies
     cookie_file = get_cookie_file("instagram")
     ydl_opts = {
         "quiet": True,
@@ -310,18 +459,15 @@ async def resolve_instagram(url: str) -> dict:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-
             if info.get("_type") == "playlist":
                 entries = info.get("entries", [])
                 valid_entries = [e for e in entries if e and (e.get("url") or e.get("formats"))]
                 if not valid_entries:
                     raise Exception("no valid entries")
                 info = valid_entries[0]
-
             ext = info.get("ext", "mp4")
             is_image = ext in ["jpg", "jpeg", "png", "webp"]
             direct_url = info.get("url", "")
-
             if not direct_url and info.get("formats"):
                 formats = [f for f in info["formats"] if f.get("url")]
                 if is_image:
@@ -329,7 +475,6 @@ async def resolve_instagram(url: str) -> dict:
                 else:
                     mp4_formats = [f for f in formats if f.get("ext") == "mp4"]
                     direct_url = mp4_formats[-1]["url"] if mp4_formats else (formats[-1].get("url", "") if formats else "")
-
             if direct_url:
                 return {
                     "success": True,
@@ -345,16 +490,20 @@ async def resolve_instagram(url: str) -> dict:
     except Exception:
         pass
 
-    # Essai 2 — API ddinstagram
+    # Essai 2 — APIs tierces pour photos
+    result = await resolve_instagram_photo(url)
+    if result.get("success"):
+        return result
+
+    # Essai 3 — ddinstagram
     try:
         shortcode = ""
         parts = url.rstrip("/").split("/")
         for i, p in enumerate(parts):
             if p in ["p", "reel", "tv", "stories"]:
                 if i + 1 < len(parts):
-                    shortcode = parts[i + 1]
+                    shortcode = parts[i + 1].split("?")[0]
                     break
-
         if shortcode:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 resp = await client.get(
@@ -363,7 +512,7 @@ async def resolve_instagram(url: str) -> dict:
                 )
                 if resp.status_code == 200:
                     video_urls = re.findall(r'https://[^"\']*\.mp4[^"\']*', resp.text)
-                    image_urls = re.findall(r'https://[^"\']*\.jpg[^"\']*', resp.text)
+                    image_urls = re.findall(r'https://[^"\']*scontent[^"\']*\.jpg[^"\']*', resp.text)
                     if video_urls:
                         return {
                             "success": True,
@@ -393,7 +542,7 @@ async def resolve_instagram(url: str) -> dict:
 
     return {
         "success": False,
-        "error": "Impossible de telecharger ce contenu Instagram. Verifiez que le contenu est public ou reconnectez-vous."
+        "error": "Impossible de telecharger ce contenu Instagram. Seuls les contenus publics sont supportes."
     }
 
 async def resolve_facebook(url: str) -> dict:
@@ -410,7 +559,6 @@ async def resolve_facebook(url: str) -> dict:
         ydl_opts["http_headers"] = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -426,10 +574,7 @@ async def resolve_facebook(url: str) -> dict:
                 mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
                 direct_url = mp4_formats[-1]["url"] if mp4_formats else formats[-1].get("url", "")
             if not direct_url:
-                return {
-                    "success": False,
-                    "error": "Impossible d'extraire ce contenu Facebook."
-                }
+                return {"success": False, "error": "Impossible d'extraire ce contenu Facebook."}
             return {
                 "success": True,
                 "direct_url": direct_url,
@@ -491,10 +636,7 @@ async def resolve_video(req: ResolveRequest):
             if "url" in info:
                 direct_url = info["url"]
             elif "formats" in info and info["formats"]:
-                mp4_formats = [
-                    f for f in info["formats"]
-                    if f.get("ext") == "mp4" and f.get("url")
-                ]
+                mp4_formats = [f for f in info["formats"] if f.get("ext") == "mp4" and f.get("url")]
                 if mp4_formats:
                     direct_url = mp4_formats[-1]["url"]
                 else:
