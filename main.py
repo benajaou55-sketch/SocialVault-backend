@@ -20,9 +20,10 @@ app.add_middleware(
 class ResolveRequest(BaseModel):
     url: str
 
-INSTAGRAM_COOKIES = "instagram_cookies.txt"
-FACEBOOK_COOKIES = "facebook_cookies.txt"
-TIKTOK_COOKIES = "tiktok.com_cookies.txt"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTAGRAM_COOKIES = os.path.join(BASE_DIR, "instagram_cookies.txt")
+FACEBOOK_COOKIES = os.path.join(BASE_DIR, "facebook_cookies.txt")
+TIKTOK_COOKIES = os.path.join(BASE_DIR, "tiktok.com_cookies.txt")
 
 def get_cookie_file(platform: str):
     if platform == "instagram" and os.path.exists(INSTAGRAM_COOKIES):
@@ -44,8 +45,17 @@ def health():
 @app.get("/check")
 def check_files():
     files = {}
-    for f in ["instagram_cookies.txt", "facebook_cookies.txt", "tiktok.com_cookies.txt"]:
-        files[f] = os.path.exists(f)
+    for name, path in [
+        ("instagram_cookies.txt", INSTAGRAM_COOKIES),
+        ("facebook_cookies.txt", FACEBOOK_COOKIES),
+        ("tiktok.com_cookies.txt", TIKTOK_COOKIES)
+    ]:
+        files[name] = os.path.exists(path)
+    files["base_dir"] = BASE_DIR
+    try:
+        files["dir_contents"] = os.listdir(BASE_DIR)
+    except Exception:
+        files["dir_contents"] = []
     return files
 
 @app.get("/download")
@@ -293,9 +303,6 @@ async def resolve_twitter(url: str) -> dict:
     }
 
 async def resolve_instagram_photo(url: str) -> dict:
-    """Essaie plusieurs APIs pour extraire les photos Instagram."""
-
-    # Extraire le shortcode
     shortcode = ""
     parts = url.rstrip("/").split("/")
     for i, p in enumerate(parts):
@@ -307,41 +314,7 @@ async def resolve_instagram_photo(url: str) -> dict:
     if not shortcode:
         return {"success": False, "error": "Lien Instagram invalide."}
 
-    # API 1 — instagramdownloader.io
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.post(
-                "https://instagramdownloader.io/api/index.php",
-                data={"url": url},
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "X-Requested-With": "XMLHttpRequest"
-                }
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("success"):
-                    media = data.get("media", [])
-                    if media:
-                        item = media[0]
-                        direct_url = item.get("url", "")
-                        is_video = item.get("type", "") == "video"
-                        if direct_url:
-                            return {
-                                "success": True,
-                                "direct_url": direct_url,
-                                "title": "Media Instagram",
-                                "thumbnail": direct_url if not is_video else "",
-                                "duration": 0,
-                                "platform": "instagram",
-                                "ext": "mp4" if is_video else "jpg",
-                                "is_image": not is_video,
-                                "all_images": []
-                            }
-    except Exception:
-        pass
-
-    # API 2 — snapinsta
+    # API 1 — snapinsta
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             token_resp = await client.get(
@@ -350,7 +323,6 @@ async def resolve_instagram_photo(url: str) -> dict:
             )
             token_match = re.search(r'name="_token"\s+value="([^"]+)"', token_resp.text)
             token = token_match.group(1) if token_match else ""
-
             if token:
                 dl_resp = await client.post(
                     "https://snapinsta.app/action.php",
@@ -393,7 +365,7 @@ async def resolve_instagram_photo(url: str) -> dict:
     except Exception:
         pass
 
-    # API 3 — saveinsta
+    # API 2 — saveinsta
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.post(
@@ -434,6 +406,40 @@ async def resolve_instagram_photo(url: str) -> dict:
                         "is_image": True,
                         "all_images": []
                     }
+    except Exception:
+        pass
+
+    # API 3 — instagramdownloader
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://instagramdownloader.io/api/index.php",
+                data={"url": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "X-Requested-With": "XMLHttpRequest"
+                }
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success"):
+                    media = data.get("media", [])
+                    if media:
+                        item = media[0]
+                        direct_url = item.get("url", "")
+                        is_video = item.get("type", "") == "video"
+                        if direct_url:
+                            return {
+                                "success": True,
+                                "direct_url": direct_url,
+                                "title": "Media Instagram",
+                                "thumbnail": direct_url if not is_video else "",
+                                "duration": 0,
+                                "platform": "instagram",
+                                "ext": "mp4" if is_video else "jpg",
+                                "is_image": not is_video,
+                                "all_images": []
+                            }
     except Exception:
         pass
 
