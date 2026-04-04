@@ -7,8 +7,6 @@ import uvicorn
 import httpx
 import re
 import os
-import http.cookiejar
-import instaloader
 
 app = FastAPI()
 
@@ -304,28 +302,6 @@ async def resolve_twitter(url: str) -> dict:
         "error": "Ce tweet ne contient pas de media ou le contenu est prive."
     }
 
-def _load_instaloader_with_cookies() -> instaloader.Instaloader:
-    """Crée une instance Instaloader et charge les cookies Instagram si disponibles."""
-    L = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        save_metadata=False,
-        quiet=True,
-    )
-    cookie_file = get_cookie_file("instagram")
-    if cookie_file:
-        try:
-            cj = http.cookiejar.MozillaCookieJar(cookie_file)
-            cj.load(ignore_discard=True, ignore_expires=True)
-            for cookie in cj:
-                L.context._session.cookies.set(
-                    cookie.name, cookie.value, domain=cookie.domain
-                )
-        except Exception:
-            pass
-    return L
-
 async def resolve_instagram_photo(url: str) -> dict:
     shortcode = ""
     parts = url.rstrip("/").split("/")
@@ -338,68 +314,7 @@ async def resolve_instagram_photo(url: str) -> dict:
     if not shortcode:
         return {"success": False, "error": "Lien Instagram invalide."}
 
-    # --- Essai 1 : Instaloader (méthode principale) ---
-    try:
-        L = _load_instaloader_with_cookies()
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-
-        # Carrousel (plusieurs images/vidéos)
-        if post.typename == "GraphSidecar":
-            all_media = []
-            for node in post.get_sidecar_nodes():
-                if node.is_video:
-                    all_media.append(node.video_url)
-                else:
-                    all_media.append(node.display_url)
-            if all_media:
-                return {
-                    "success": True,
-                    "direct_url": all_media[0],
-                    "title": post.caption[:100] if post.caption else "Carrousel Instagram",
-                    "thumbnail": all_media[0],
-                    "duration": 0,
-                    "platform": "instagram",
-                    "ext": "jpg",
-                    "is_image": True,
-                    "all_images": all_media
-                }
-
-        # Vidéo / Reel
-        if post.is_video:
-            return {
-                "success": True,
-                "direct_url": post.video_url,
-                "title": post.caption[:100] if post.caption else "Video Instagram",
-                "thumbnail": post.url,
-                "duration": int(post.video_duration or 0),
-                "platform": "instagram",
-                "ext": "mp4",
-                "is_image": False,
-                "all_images": []
-            }
-
-        # Photo simple
-        img_url = post.url
-        return {
-            "success": True,
-            "direct_url": img_url,
-            "title": post.caption[:100] if post.caption else "Photo Instagram",
-            "thumbnail": img_url,
-            "duration": 0,
-            "platform": "instagram",
-            "ext": "jpg",
-            "is_image": True,
-            "all_images": [img_url]
-        }
-
-    except instaloader.exceptions.LoginRequiredException:
-        return {"success": False, "error": "Ce contenu Instagram necessite une connexion."}
-    except instaloader.exceptions.PrivateProfileNotFollowedException:
-        return {"success": False, "error": "Ce profil Instagram est prive."}
-    except Exception:
-        pass
-
-    # --- Essai 2 : snapinsta ---
+    # API 1 — snapinsta
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             token_resp = await client.get(
@@ -450,7 +365,7 @@ async def resolve_instagram_photo(url: str) -> dict:
     except Exception:
         pass
 
-    # --- Essai 3 : saveinsta ---
+    # API 2 — saveinsta
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.post(
@@ -494,7 +409,7 @@ async def resolve_instagram_photo(url: str) -> dict:
     except Exception:
         pass
 
-    # --- Essai 4 : instagramdownloader ---
+    # API 3 — instagramdownloader
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.post(
@@ -531,14 +446,6 @@ async def resolve_instagram_photo(url: str) -> dict:
     return {"success": False, "error": ""}
 
 async def resolve_instagram(url: str) -> dict:
-
-    # --- Priorité 1 : Instaloader pour les posts /p/ (photos, carrousels, reels) ---
-    if "/p/" in url or "/reel/" in url:
-        result = await resolve_instagram_photo(url)
-        if result.get("success"):
-            return result
-
-    # --- Priorité 2 : yt-dlp avec cookies ---
     cookie_file = get_cookie_file("instagram")
     ydl_opts = {
         "quiet": True,
@@ -588,12 +495,10 @@ async def resolve_instagram(url: str) -> dict:
     except Exception:
         pass
 
-    # --- Priorité 3 : APIs tierces (fallback) ---
     result = await resolve_instagram_photo(url)
     if result.get("success"):
         return result
 
-    # --- Priorité 4 : ddinstagram ---
     try:
         shortcode = ""
         parts = url.rstrip("/").split("/")
