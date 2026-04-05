@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -57,6 +57,47 @@ def check_files():
     except Exception:
         files["dir_contents"] = []
     return files
+
+@app.post("/set_cookies")
+async def set_cookies(request: Request):
+    try:
+        body = await request.json()
+        platform = body.get("platform", "")
+        cookies_str = body.get("cookies", "")
+
+        if not platform or not cookies_str:
+            return {"success": False, "error": "Donnees manquantes"}
+
+        cookie_file_map = {
+            "instagram": INSTAGRAM_COOKIES,
+            "facebook": FACEBOOK_COOKIES,
+        }
+
+        cookie_file = cookie_file_map.get(platform)
+        if not cookie_file:
+            return {"success": False, "error": "Plateforme non supportee"}
+
+        domain_map = {
+            "instagram": ".instagram.com",
+            "facebook": ".facebook.com",
+        }
+        domain = domain_map[platform]
+
+        lines = ["# Netscape HTTP Cookie File\n"]
+        for cookie_pair in cookies_str.split(";"):
+            cookie_pair = cookie_pair.strip()
+            if "=" in cookie_pair:
+                name, _, value = cookie_pair.partition("=")
+                lines.append(
+                    f"{domain}\tTRUE\t/\tTRUE\t2147483647\t{name.strip()}\t{value.strip()}\n"
+                )
+
+        with open(cookie_file, "w") as f:
+            f.writelines(lines)
+
+        return {"success": True, "message": f"Cookies {platform} sauvegardes"}
+    except Exception as e:
+        return {"success": False, "error": str(e)[:100]}
 
 @app.get("/download")
 async def download_video(url: str):
