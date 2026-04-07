@@ -64,25 +64,20 @@ async def set_cookies(request: Request):
         body = await request.json()
         platform = body.get("platform", "")
         cookies_str = body.get("cookies", "")
-
         if not platform or not cookies_str:
             return {"success": False, "error": "Donnees manquantes"}
-
         cookie_file_map = {
             "instagram": INSTAGRAM_COOKIES,
             "facebook": FACEBOOK_COOKIES,
         }
-
         cookie_file = cookie_file_map.get(platform)
         if not cookie_file:
             return {"success": False, "error": "Plateforme non supportee"}
-
         domain_map = {
             "instagram": ".instagram.com",
             "facebook": ".facebook.com",
         }
         domain = domain_map[platform]
-
         lines = ["# Netscape HTTP Cookie File\n"]
         for cookie_pair in cookies_str.split(";"):
             cookie_pair = cookie_pair.strip()
@@ -91,10 +86,8 @@ async def set_cookies(request: Request):
                 lines.append(
                     f"{domain}\tTRUE\t/\tTRUE\t2147483647\t{name.strip()}\t{value.strip()}\n"
                 )
-
         with open(cookie_file, "w") as f:
             f.writelines(lines)
-
         return {"success": True, "message": f"Cookies {platform} sauvegardes"}
     except Exception as e:
         return {"success": False, "error": str(e)[:100]}
@@ -216,14 +209,12 @@ async def resolve_twitter(url: str) -> dict:
                 headers={"User-Agent": "Mozilla/5.0"}
             )
             data = response.json()
-
         if data.get("code") == 200:
             tweet = data.get("tweet", {})
             media = tweet.get("media", {})
             videos = media.get("videos", [])
             photos = media.get("photos", [])
             gifs = media.get("gifs", [])
-
             if videos:
                 best_video = max(videos, key=lambda v: v.get("width", 0))
                 video_url = best_video.get("url", "")
@@ -343,17 +334,16 @@ async def resolve_twitter(url: str) -> dict:
         "error": "Ce tweet ne contient pas de media ou le contenu est prive."
     }
 
-async def resolve_instagram_photo(url: str) -> dict:
+async def resolve_instagram_via_api(url: str) -> dict:
+    """Essaie plusieurs APIs tierces pour Instagram."""
+
     shortcode = ""
     parts = url.rstrip("/").split("/")
     for i, p in enumerate(parts):
-        if p in ["p", "reel", "tv", "stories"]:
+        if p in ["p", "reel", "tv", "stories", "s"]:
             if i + 1 < len(parts):
                 shortcode = parts[i + 1].split("?")[0]
                 break
-
-    if not shortcode:
-        return {"success": False, "error": "Lien Instagram invalide."}
 
     # API 1 — snapinsta
     try:
@@ -377,8 +367,8 @@ async def resolve_instagram_photo(url: str) -> dict:
                 if dl_resp.status_code == 200:
                     result = dl_resp.json()
                     html = result.get("data", "") if isinstance(result, dict) else str(result)
-                    img_urls = re.findall(r'https://[^"\']+\.jpg[^"\']*', html)
                     vid_urls = re.findall(r'https://[^"\']+\.mp4[^"\']*', html)
+                    img_urls = re.findall(r'https://[^"\']+\.jpg[^"\']*', html)
                     if vid_urls:
                         return {
                             "success": True,
@@ -450,7 +440,42 @@ async def resolve_instagram_photo(url: str) -> dict:
     except Exception:
         pass
 
-    # API 3 — instagramdownloader
+    # API 3 — igram.io
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://igram.io/api/convert",
+                json={"url": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Content-Type": "application/json",
+                    "Origin": "https://igram.io",
+                    "Referer": "https://igram.io/"
+                }
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("data", [])
+                if items:
+                    item = items[0]
+                    direct_url = item.get("url", "")
+                    is_video = "mp4" in direct_url.lower() or item.get("type") == "video"
+                    if direct_url:
+                        return {
+                            "success": True,
+                            "direct_url": direct_url,
+                            "title": "Media Instagram",
+                            "thumbnail": "",
+                            "duration": 0,
+                            "platform": "instagram",
+                            "ext": "mp4" if is_video else "jpg",
+                            "is_image": not is_video,
+                            "all_images": []
+                        }
+    except Exception:
+        pass
+
+    # API 4 — instagramdownloader
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.post(
@@ -486,7 +511,99 @@ async def resolve_instagram_photo(url: str) -> dict:
 
     return {"success": False, "error": ""}
 
+async def resolve_facebook_story(url: str) -> dict:
+    """APIs tierces pour les stories Facebook."""
+
+    # API 1 — fbdown.net
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://fbdown.net/download.php",
+                data={"url": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://fbdown.net/"
+                }
+            )
+            if resp.status_code == 200:
+                vid_urls = re.findall(r'https://[^"\']+\.mp4[^"\']*', resp.text)
+                if vid_urls:
+                    return {
+                        "success": True,
+                        "direct_url": vid_urls[0],
+                        "title": "Story Facebook",
+                        "thumbnail": "",
+                        "duration": 0,
+                        "platform": "facebook",
+                        "ext": "mp4",
+                        "is_image": False,
+                        "all_images": []
+                    }
+    except Exception:
+        pass
+
+    # API 2 — getfvid
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://www.getfvid.com/downloader",
+                data={"url": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://www.getfvid.com/"
+                }
+            )
+            if resp.status_code == 200:
+                vid_urls = re.findall(r'https://[^"\']+\.mp4[^"\']*', resp.text)
+                if vid_urls:
+                    return {
+                        "success": True,
+                        "direct_url": vid_urls[0],
+                        "title": "Story Facebook",
+                        "thumbnail": "",
+                        "duration": 0,
+                        "platform": "facebook",
+                        "ext": "mp4",
+                        "is_image": False,
+                        "all_images": []
+                    }
+    except Exception:
+        pass
+
+    # API 3 — fdown.net
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://fdown.net/download.php",
+                data={"URLz": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://fdown.net/"
+                }
+            )
+            if resp.status_code == 200:
+                vid_urls = re.findall(r'https://[^"\']+\.mp4[^"\']*', resp.text)
+                if vid_urls:
+                    return {
+                        "success": True,
+                        "direct_url": vid_urls[0],
+                        "title": "Story Facebook",
+                        "thumbnail": "",
+                        "duration": 0,
+                        "platform": "facebook",
+                        "ext": "mp4",
+                        "is_image": False,
+                        "all_images": []
+                    }
+    except Exception:
+        pass
+
+    return {"success": False, "error": ""}
+
 async def resolve_instagram(url: str) -> dict:
+    is_story = "/stories/" in url.lower()
+
+    # Essai 1 — yt-dlp avec cookies
     cookie_file = get_cookie_file("instagram")
     ydl_opts = {
         "quiet": True,
@@ -536,10 +653,12 @@ async def resolve_instagram(url: str) -> dict:
     except Exception:
         pass
 
-    result = await resolve_instagram_photo(url)
+    # Essai 2 — APIs tierces
+    result = await resolve_instagram_via_api(url)
     if result.get("success"):
         return result
 
+    # Essai 3 — ddinstagram
     try:
         shortcode = ""
         parts = url.rstrip("/").split("/")
@@ -549,9 +668,11 @@ async def resolve_instagram(url: str) -> dict:
                     shortcode = parts[i + 1].split("?")[0]
                     break
         if shortcode:
+            dd_url = f"https://ddinstagram.com/p/{shortcode}/" if not is_story else \
+                     f"https://ddinstagram.com/stories/{shortcode}/"
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 resp = await client.get(
-                    f"https://ddinstagram.com/p/{shortcode}/",
+                    dd_url,
                     headers={"User-Agent": "Mozilla/5.0"}
                 )
                 if resp.status_code == 200:
@@ -561,7 +682,7 @@ async def resolve_instagram(url: str) -> dict:
                         return {
                             "success": True,
                             "direct_url": video_urls[0],
-                            "title": "Video Instagram",
+                            "title": "Story Instagram" if is_story else "Video Instagram",
                             "thumbnail": image_urls[0] if image_urls else "",
                             "duration": 0,
                             "platform": "instagram",
@@ -584,12 +705,26 @@ async def resolve_instagram(url: str) -> dict:
     except Exception:
         pass
 
+    if is_story:
+        return {
+            "success": False,
+            "error": "Les stories Instagram necessitent une connexion. Connectez-vous dans Parametres."
+        }
     return {
         "success": False,
         "error": "Impossible de telecharger ce contenu Instagram. Seuls les contenus publics sont supportes."
     }
 
 async def resolve_facebook(url: str) -> dict:
+    is_story = "/stories/" in url.lower()
+
+    # Pour les stories — essayer APIs tierces d'abord
+    if is_story:
+        result = await resolve_facebook_story(url)
+        if result.get("success"):
+            return result
+
+    # yt-dlp avec cookies
     cookie_file = get_cookie_file("facebook")
     ydl_opts = {
         "quiet": True,
@@ -603,6 +738,7 @@ async def resolve_facebook(url: str) -> dict:
         ydl_opts["http_headers"] = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -618,7 +754,7 @@ async def resolve_facebook(url: str) -> dict:
                 mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
                 direct_url = mp4_formats[-1]["url"] if mp4_formats else formats[-1].get("url", "")
             if not direct_url:
-                return {"success": False, "error": "Impossible d'extraire ce contenu Facebook."}
+                raise Exception("no direct url")
             return {
                 "success": True,
                 "direct_url": direct_url,
@@ -632,10 +768,15 @@ async def resolve_facebook(url: str) -> dict:
             }
     except Exception as e:
         error_msg = str(e)
-        if "login" in error_msg.lower() or "cookie" in error_msg.lower():
+        if is_story:
             return {
                 "success": False,
-                "error": "Ce contenu Facebook necessite une connexion. Seuls les contenus publics et vos propres stories sont supportes."
+                "error": "Les stories Facebook necessitent une connexion. Connectez-vous dans Parametres."
+            }
+        elif "login" in error_msg.lower() or "cookie" in error_msg.lower():
+            return {
+                "success": False,
+                "error": "Ce contenu Facebook necessite une connexion."
             }
         elif "private" in error_msg.lower():
             return {"success": False, "error": "Ce contenu Facebook est prive."}
