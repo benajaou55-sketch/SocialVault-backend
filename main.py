@@ -164,44 +164,134 @@ async def resolve_instagram(url, extra_cookies=""):
     is_story = "/stories/" in url.lower()
     tmp = None
     try:
-        if extra_cookies: tmp = cookies_to_tempfile(extra_cookies, "instagram")
+        if extra_cookies:
+            tmp = cookies_to_tempfile(extra_cookies, "instagram")
         cf = tmp or get_cookie_file("instagram")
-        opts = {"quiet":True,"no_warnings":True,"skip_download":True,"format":"best","socket_timeout":30}
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "best",
+            "socket_timeout": 30
+        }
         if cf:
             opts["cookiefile"] = cf
-            opts["http_headers"] = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"}
+            opts["http_headers"] = {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"
+            }
+
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
+
+            # ── CAS CARROUSEL : playlist avec plusieurs entrées ───────────────
             if info.get("_type") == "playlist":
-                entries = [e for e in info.get("entries",[]) if e and (e.get("url") or e.get("formats"))]
-                if not entries: raise Exception("no entries")
-                info = entries[0]
-            ext = info.get("ext","mp4")
-            is_image = ext in ["jpg","jpeg","png","webp"]
-            du = info.get("url","")
+                entries = [e for e in info.get("entries", []) if e]
+
+                # Filtrer les entrées valides (avec URL)
+                valid = []
+                for e in entries:
+                    du = e.get("url", "")
+                    if not du and e.get("formats"):
+                        fmts = [f for f in e["formats"] if f.get("url")]
+                        du = fmts[-1]["url"] if fmts else ""
+                    if du:
+                        ext = e.get("ext", "jpg")
+                        valid.append({
+                            "url": du,
+                            "is_video": ext == "mp4",
+                            "ext": ext,
+                            "thumbnail": e.get("thumbnail", "")
+                        })
+
+                if len(valid) == 0:
+                    raise Exception("no entries")
+
+                # Un seul élément → traiter comme simple
+                if len(valid) == 1:
+                    item = valid[0]
+                    ext = item["ext"]
+                    return {
+                        "success": True,
+                        "direct_url": item["url"],
+                        "title": info.get("title", "Instagram"),
+                        "thumbnail": item["thumbnail"],
+                        "duration": 0,
+                        "platform": "instagram",
+                        "ext": ext,
+                        "is_image": ext in ["jpg", "jpeg", "png", "webp"],
+                        "all_images": [],
+                        "carousel_items": []
+                    }
+
+                # Plusieurs éléments → retourner carousel_items
+                # direct_url = premier élément (fallback si l'app ne gère pas carousel)
+                first = valid[0]
+                carousel_items = [
+                    {
+                        "url": item["url"],
+                        "is_video": item["is_video"],
+                        "thumbnail": item["thumbnail"],
+                        "index": i
+                    }
+                    for i, item in enumerate(valid)
+                ]
+                # all_images = URLs des images uniquement (compatibilité ancienne)
+                all_images = [item["url"] for item in valid if not item["is_video"]]
+
+                return {
+                    "success": True,
+                    "direct_url": first["url"],
+                    "title": info.get("title", "Instagram Carrousel"),
+                    "thumbnail": first["thumbnail"],
+                    "duration": 0,
+                    "platform": "instagram",
+                    "ext": first["ext"],
+                    "is_image": not first["is_video"],
+                    "all_images": all_images,
+                    "carousel_items": carousel_items  # ← NOUVEAU champ pour l'app
+                }
+
+            # ── CAS SIMPLE : photo ou vidéo unique ───────────────────────────
+            ext = info.get("ext", "mp4")
+            is_image = ext in ["jpg", "jpeg", "png", "webp"]
+            du = info.get("url", "")
             if not du and info.get("formats"):
                 fmts = [f for f in info["formats"] if f.get("url")]
-                mp4s = [f for f in fmts if f.get("ext")=="mp4"]
-                du = mp4s[-1]["url"] if mp4s else (fmts[-1].get("url","") if fmts else "")
+                mp4s = [f for f in fmts if f.get("ext") == "mp4"]
+                du = mp4s[-1]["url"] if mp4s else (fmts[-1].get("url", "") if fmts else "")
             if du:
-                return {"success":True,"direct_url":du,"title":info.get("title","Instagram"),
-                    "thumbnail":info.get("thumbnail",""),"duration":int(info.get("duration") or 0),
-                    "platform":"instagram","ext":ext,"is_image":is_image,"all_images":[]}
-    except Exception: pass
+                return {
+                    "success": True,
+                    "direct_url": du,
+                    "title": info.get("title", "Instagram"),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "duration": int(info.get("duration") or 0),
+                    "platform": "instagram",
+                    "ext": ext,
+                    "is_image": is_image,
+                    "all_images": [],
+                    "carousel_items": []
+                }
+
+    except Exception:
+        pass
     finally:
         if tmp and os.path.exists(tmp):
             try: os.unlink(tmp)
             except: pass
 
+    # Fallback snapinsta
     result = await resolve_instagram_via_api(url)
-    if result.get("success"): return result
-    msg = "Impossible de télécharger cette story Instagram." if is_story \
-          else "Impossible de télécharger ce contenu Instagram."
+    if result.get("success"):
+        result.setdefault("carousel_items", [])
+        return result
+
+    msg = ("Impossible de télécharger cette story Instagram." if is_story
+           else "Impossible de télécharger ce contenu Instagram.")
     return {"success": False, "error": msg}
 
 async def resolve_facebook(url, extra_cookies=""):
     lower = url.lower()
-    # FIX — Rejeter URLs non-contenu (checkpoint, login, page d'accueil)
     for bad in ["checkpoint","login.php","/login","facebook.com/?","m.facebook.com/?",
                 "web.facebook.com/?","facebook.com/home","lm.facebook.com"]:
         if bad in lower:
