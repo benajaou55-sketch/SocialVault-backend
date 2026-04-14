@@ -174,20 +174,20 @@ async def resolve_instagram(url, extra_cookies=""):
             "format": "best",
             "socket_timeout": 30
         }
+
+        # ── CORRECTION 1 : User-Agent mobile TOUJOURS actif pour Instagram ──
+        opts["http_headers"] = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"
+        }
         if cf:
             opts["cookiefile"] = cf
-            opts["http_headers"] = {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"
-            }
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-            # ── CAS CARROUSEL : playlist avec plusieurs entrées ───────────────
+            # ── CAS CARROUSEL ─────────────────────────────────────────────────
             if info.get("_type") == "playlist":
                 entries = [e for e in info.get("entries", []) if e]
-
-                # Filtrer les entrées valides (avec URL)
                 valid = []
                 for e in entries:
                     du = e.get("url", "")
@@ -206,7 +206,6 @@ async def resolve_instagram(url, extra_cookies=""):
                 if len(valid) == 0:
                     raise Exception("no entries")
 
-                # Un seul élément → traiter comme simple
                 if len(valid) == 1:
                     item = valid[0]
                     ext = item["ext"]
@@ -223,8 +222,6 @@ async def resolve_instagram(url, extra_cookies=""):
                         "carousel_items": []
                     }
 
-                # Plusieurs éléments → retourner carousel_items
-                # direct_url = premier élément (fallback si l'app ne gère pas carousel)
                 first = valid[0]
                 carousel_items = [
                     {
@@ -235,7 +232,6 @@ async def resolve_instagram(url, extra_cookies=""):
                     }
                     for i, item in enumerate(valid)
                 ]
-                # all_images = URLs des images uniquement (compatibilité ancienne)
                 all_images = [item["url"] for item in valid if not item["is_video"]]
 
                 return {
@@ -248,10 +244,10 @@ async def resolve_instagram(url, extra_cookies=""):
                     "ext": first["ext"],
                     "is_image": not first["is_video"],
                     "all_images": all_images,
-                    "carousel_items": carousel_items  # ← NOUVEAU champ pour l'app
+                    "carousel_items": carousel_items
                 }
 
-            # ── CAS SIMPLE : photo ou vidéo unique ───────────────────────────
+            # ── CAS SIMPLE ────────────────────────────────────────────────────
             ext = info.get("ext", "mp4")
             is_image = ext in ["jpg", "jpeg", "png", "webp"]
             du = info.get("url", "")
@@ -280,13 +276,13 @@ async def resolve_instagram(url, extra_cookies=""):
             try: os.unlink(tmp)
             except: pass
 
-    # Fallback snapinsta
+    # ── CORRECTION 2 : Fallback SnapInsta pour tout type de contenu ──────────
     result = await resolve_instagram_via_api(url)
     if result.get("success"):
         result.setdefault("carousel_items", [])
         return result
 
-    msg = ("Impossible de télécharger cette story Instagram." if is_story
+    msg = ("Story Instagram expirée ou privée." if is_story
            else "Impossible de télécharger ce contenu Instagram.")
     return {"success": False, "error": msg}
 
