@@ -140,7 +140,7 @@ async def resolve_twitter(url):
     return {"success": False, "error": "Ce tweet ne contient pas de média ou est privé."}
 
 async def resolve_instagram_via_api(url):
-# Nettoyer les paramètres inutiles qui bloquent yt-dlp
+# Nettoyer les paramètres inutiles
     import re
     url = re.sub(r'[?&]igsh=[^&]*', '', url)
     url = re.sub(r'[?&]img_index=[^&]*', '', url)
