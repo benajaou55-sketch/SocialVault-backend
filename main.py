@@ -140,11 +140,10 @@ async def resolve_twitter(url):
     return {"success": False, "error": "Ce tweet ne contient pas de média ou est privé."}
 
 async def resolve_instagram_via_api(url):
-    # Nettoyer l'URL
+    # Nettoyage préventif
     url = re.sub(r'[?&]igsh=[^&]*', '', url)
     url = re.sub(r'[?&]img_index=[^&]*', '', url)
     url = url.rstrip('?&')
-
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
             tr = await c.get("https://snapinsta.app/", headers={"User-Agent":"Mozilla/5.0"})
@@ -166,11 +165,11 @@ async def resolve_instagram_via_api(url):
     return {"success": False, "error": ""}
 
 async def resolve_instagram(url, extra_cookies=""):
-    # Nettoyer l'URL avant traitement
+    # NETTOYAGE URL
     url = re.sub(r'[?&]igsh=[^&]*', '', url)
     url = re.sub(r'[?&]img_index=[^&]*', '', url)
     url = url.rstrip('?&')
-    
+
     is_story = "/stories/" in url.lower()
     tmp = None
     try:
@@ -183,7 +182,9 @@ async def resolve_instagram(url, extra_cookies=""):
             "skip_download": True,
             "format": "best",
             "socket_timeout": 30,
-            "http_headers": {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"}
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"
+            }
         }
         if cf: opts["cookiefile"] = cf
 
@@ -200,19 +201,20 @@ async def resolve_instagram(url, extra_cookies=""):
                     if du:
                         ext = e.get("ext", "jpg")
                         valid.append({"url": du, "is_video": ext == "mp4", "ext": ext, "thumbnail": e.get("thumbnail", "")})
-                if not valid: raise Exception("no entries")
+
+                if len(valid) == 0: raise Exception("no entries")
                 if len(valid) == 1:
                     item = valid[0]
                     return {"success": True, "direct_url": item["url"], "title": info.get("title", "Instagram"),
-                            "thumbnail": item["thumbnail"], "duration": 0, "platform": "instagram", "ext": item["ext"],
-                            "is_image": not item["is_video"], "all_images": [], "carousel_items": []}
-                
+                        "thumbnail": item["thumbnail"], "duration": 0, "platform": "instagram", "ext": item["ext"],
+                        "is_image": item["ext"] in ["jpg", "jpeg", "png", "webp"], "all_images": [], "carousel_items": []}
+
                 first = valid[0]
                 carousel_items = [{"url": item["url"], "is_video": item["is_video"], "thumbnail": item["thumbnail"], "index": i} for i, item in enumerate(valid)]
                 all_images = [item["url"] for item in valid if not item["is_video"]]
                 return {"success": True, "direct_url": first["url"], "title": info.get("title", "Instagram Carrousel"),
-                        "thumbnail": first["thumbnail"], "duration": 0, "platform": "instagram", "ext": first["ext"],
-                        "is_image": not first["is_video"], "all_images": all_images, "carousel_items": carousel_items}
+                    "thumbnail": first["thumbnail"], "duration": 0, "platform": "instagram", "ext": first["ext"],
+                    "is_image": not first["is_video"], "all_images": all_images, "carousel_items": carousel_items}
 
             ext = info.get("ext", "mp4")
             du = info.get("url", "")
@@ -222,9 +224,9 @@ async def resolve_instagram(url, extra_cookies=""):
                 du = mp4s[-1]["url"] if mp4s else (fmts[-1].get("url", "") if fmts else "")
             if du:
                 return {"success": True, "direct_url": du, "title": info.get("title", "Instagram"),
-                        "thumbnail": info.get("thumbnail", ""), "duration": int(info.get("duration") or 0),
-                        "platform": "instagram", "ext": ext, "is_image": ext in ["jpg", "jpeg", "png", "webp"],
-                        "all_images": [], "carousel_items": []}
+                    "thumbnail": info.get("thumbnail", ""), "duration": int(info.get("duration") or 0),
+                    "platform": "instagram", "ext": ext, "is_image": ext in ["jpg", "jpeg", "png", "webp"],
+                    "all_images": [], "carousel_items": []}
     except Exception: pass
     finally:
         if tmp and os.path.exists(tmp):
@@ -235,6 +237,7 @@ async def resolve_instagram(url, extra_cookies=""):
     if result.get("success"):
         result.setdefault("carousel_items", [])
         return result
+
     msg = "Story Instagram expirée ou privée." if is_story else "Impossible de télécharger ce contenu Instagram."
     return {"success": False, "error": msg}
 
@@ -262,10 +265,13 @@ async def resolve_facebook(url, extra_cookies=""):
                 fmts = info["formats"]
                 mp4s = [f for f in fmts if f.get("ext")=="mp4" and f.get("url")]
                 du = mp4s[-1]["url"] if mp4s else fmts[-1].get("url","")
-            return {"success":True,"direct_url":du,"title":info.get("title","Facebook"), "thumbnail":info.get("thumbnail",""),"duration":int(info.get("duration") or 0),"platform":"facebook","ext":ext,"is_image":ext in ["jpg","jpeg","png","webp"],"all_images":[]}
+            if not du: raise Exception("no url")
+            return {"success":True,"direct_url":du,"title":info.get("title","Facebook"),
+                "thumbnail":info.get("thumbnail",""),"duration":int(info.get("duration") or 0),
+                "platform":"facebook","ext":ext,"is_image":ext in ["jpg","jpeg","png","webp"],"all_images":[]}
     except Exception as e:
         if is_story: return {"success":False,"error":"Impossible de télécharger cette story."}
-        return {"success":False,"error":f"Erreur Facebook: {str(e)[:100]}"}
+        return {"success":False,"error":f"Erreur Facebook: {str(e)[:150]}"}
     finally:
         if tmp and os.path.exists(tmp):
             try: os.unlink(tmp)
@@ -276,7 +282,8 @@ async def resolve_video(req: ResolveRequest):
     url = req.url.strip()
     cookies = req.cookies.strip()
     if any(b in url.lower() for b in ["youtube.com","youtu.be"]): raise HTTPException(status_code=403, detail="YouTube non supporté")
-    if "tiktok.com" in url.lower(): return await (resolve_tiktok_story(url) if "/story/" in url.lower() or "/photo/" in url.lower() else resolve_tiktok(url))
+    if "tiktok.com" in url.lower():
+        return await (resolve_tiktok_story(url) if "/story/" in url.lower() or "/photo/" in url.lower() else resolve_tiktok(url))
     if any(x in url.lower() for x in ["twitter.com","x.com","t.co"]): return await resolve_twitter(url)
     if "instagram.com" in url.lower(): return await resolve_instagram(url, extra_cookies=cookies)
     if any(x in url.lower() for x in ["facebook.com","fb.watch","fb.com"]): return await resolve_facebook(url, extra_cookies=cookies)
@@ -288,7 +295,10 @@ async def resolve_video(req: ResolveRequest):
             if not du and info.get("formats"):
                 mp4s = [f for f in info["formats"] if f.get("ext")=="mp4" and f.get("url")]
                 du = mp4s[-1]["url"] if mp4s else info["formats"][-1].get("url","")
-            return {"success":True,"direct_url":du,"title":info.get("title","Media"),"thumbnail":info.get("thumbnail",""),"duration":int(info.get("duration") or 0),"platform":"unknown","ext":ext,"is_image":ext in ["jpg","jpeg","png","webp"],"all_images":[]}
+            if not du: return {"success":False,"error":"Impossible de résoudre cette URL"}
+            return {"success":True,"direct_url":du,"title":info.get("title","Media"),
+                "thumbnail":info.get("thumbnail",""),"duration":int(info.get("duration") or 0),
+                "platform":"unknown","ext":ext,"is_image":ext in ["jpg","jpeg","png","webp"],"all_images":[]}
     except Exception as e: return {"success":False,"error":str(e)[:200]}
 
 if __name__ == "__main__":
