@@ -140,6 +140,13 @@ async def resolve_twitter(url):
     return {"success": False, "error": "Ce tweet ne contient pas de média ou est privé."}
 
 async def resolve_instagram_via_api(url):
+    # Nettoyer les paramètres inutiles qui bloquent yt-dlp
+    import re
+    url = re.sub(r'[?&]igsh=[^&]*', '', url)
+    url = re.sub(r'[?&]img_index=[^&]*', '', url)
+    url = url.rstrip('?&')
+    
+    is_story = "/stories/" in url.lower()
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
             tr = await c.get("https://snapinsta.app/", headers={"User-Agent":"Mozilla/5.0"})
