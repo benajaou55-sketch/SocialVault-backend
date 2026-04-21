@@ -170,7 +170,6 @@ async def resolve_instagram_via_api(url):
     return {"success": False, "error": ""}
 
 async def resolve_instagram(url, extra_cookies=""):
-    # ── Nettoyer l'URL des paramètres qui bloquent yt-dlp ────────────────────
     url = clean_instagram_url(url)
 
     is_story = "/stories/" in url.lower()
@@ -186,7 +185,6 @@ async def resolve_instagram(url, extra_cookies=""):
             "format": "best",
             "socket_timeout": 30
         }
-        # User-Agent mobile toujours actif pour Instagram
         opts["http_headers"] = {
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"
         }
@@ -196,7 +194,6 @@ async def resolve_instagram(url, extra_cookies=""):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-            # ── CAS CARROUSEL ─────────────────────────────────────────────────
             if info.get("_type") == "playlist":
                 entries = [e for e in info.get("entries", []) if e]
                 valid = []
@@ -258,7 +255,6 @@ async def resolve_instagram(url, extra_cookies=""):
                     "carousel_items": carousel_items
                 }
 
-            # ── CAS SIMPLE ────────────────────────────────────────────────────
             ext = info.get("ext", "mp4")
             is_image = ext in ["jpg", "jpeg", "png", "webp"]
             du = info.get("url", "")
@@ -287,7 +283,6 @@ async def resolve_instagram(url, extra_cookies=""):
             try: os.unlink(tmp)
             except: pass
 
-    # Fallback SnapInsta
     result = await resolve_instagram_via_api(url)
     if result.get("success"):
         result.setdefault("carousel_items", [])
@@ -341,6 +336,53 @@ async def resolve_facebook(url, extra_cookies=""):
             try: os.unlink(tmp)
             except: pass
 
+async def resolve_snapchat(url: str):
+    """
+    Télécharge les vidéos Snapchat Spotlight et Stories publiques
+    qui n'ont pas de bouton de téléchargement natif.
+    """
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "best[ext=mp4]/best",
+            "socket_timeout": 30,
+            "outtmpl": "%(id)s.%(ext)s",  # Nom court pour éviter l'erreur nom trop long
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+            }
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            ext = info.get("ext", "mp4")
+            is_image = ext in ["jpg", "jpeg", "png", "webp"]
+            du = info.get("url", "")
+            if not du and info.get("formats"):
+                fmts = [f for f in info["formats"] if f.get("url")]
+                mp4s = [f for f in fmts if f.get("ext") == "mp4" and f.get("url")]
+                du = mp4s[-1]["url"] if mp4s else (fmts[-1].get("url", "") if fmts else "")
+            if not du:
+                return {"success": False, "error": "Impossible de résoudre cette vidéo Snapchat."}
+            return {
+                "success": True,
+                "direct_url": du,
+                "title": info.get("title", "Snapchat")[:100],
+                "thumbnail": info.get("thumbnail", ""),
+                "duration": int(info.get("duration") or 0),
+                "platform": "snapchat",
+                "ext": ext,
+                "is_image": is_image,
+                "all_images": []
+            }
+    except Exception as e:
+        msg = str(e).lower()
+        if "private" in msg or "login" in msg:
+            return {"success": False, "error": "Ce contenu Snapchat est privé ou introuvable."}
+        if "not supported" in msg or "unsupported" in msg:
+            return {"success": False, "error": "Ce type de contenu Snapchat n'est pas supporté. Essayez un lien Spotlight."}
+        return {"success": False, "error": "Impossible de télécharger cette vidéo Snapchat."}
+
 @app.post("/resolve")
 async def resolve_video(req: ResolveRequest):
     url = req.url.strip()
@@ -352,6 +394,8 @@ async def resolve_video(req: ResolveRequest):
     if "tiktok.com" in url.lower():
         return await (resolve_tiktok_story(url) if "/story/" in url.lower() or "/photo/" in url.lower()
                       else resolve_tiktok(url))
+    if "snapchat.com" in url.lower():
+        return await resolve_snapchat(url)
     if any(x in url.lower() for x in ["twitter.com","x.com","t.co"]):
         return await resolve_twitter(url)
     if "instagram.com" in url.lower():
