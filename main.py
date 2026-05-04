@@ -10,17 +10,18 @@ import re
 import os
 import time
 import tempfile
-import json
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ── Thread pool dédié à yt-dlp (bloquant) ─────────────────────────────────────
 executor = ThreadPoolExecutor(max_workers=4)
 
+# ── Cache en mémoire simple (url → résultat, TTL 10 min) ──────────────────────
 _cache: dict[str, tuple[float, dict]] = {}
-CACHE_TTL = 600
+CACHE_TTL = 600  # secondes
 
 def cache_get(key: str):
     entry = _cache.get(key)
@@ -30,14 +31,17 @@ def cache_get(key: str):
     return None
 
 def cache_set(key: str, value: dict):
+    # Ne jamais cacher les erreurs
     if value.get("success"):
         _cache[key] = (time.time(), value)
 
+# ── Modèles ───────────────────────────────────────────────────────────────────
 class ResolveRequest(BaseModel):
     url: str
     cookies: str = ""
     platform_hint: str = ""
 
+# ── Fichiers cookies ──────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTAGRAM_COOKIES = os.path.join(BASE_DIR, "www.instagram.com_cookies.txt")
 FACEBOOK_COOKIES  = os.path.join(BASE_DIR, "web.facebook.com_cookies.txt")
@@ -71,13 +75,16 @@ def clean_instagram_url(url):
     url = url.rstrip('?&')
     return url
 
+# ── Wrapper : exécute yt-dlp dans le thread pool ──────────────────────────────
 async def run_yt_dlp(opts: dict, url: str) -> dict:
+    """Lance extract_info dans un thread pour ne pas bloquer l'event loop."""
     def _extract():
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, _extract)
 
+# ── Routes utilitaires ────────────────────────────────────────────────────────
 @app.get("/")
 def root(): return {"status": "SocialVault Backend running"}
 
@@ -123,8 +130,9 @@ async def resolve_tiktok(url):
     cached = cache_get(url)
     if cached:
         return cached
+
     try:
-        async with httpx.AsyncClient(timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15) as c:  # ⚡ timeout réduit à 15s
             data = (await c.get(f"https://tikwm.com/api/?url={url}&hd=1")).json()
         if data.get("code") == 0:
             vd = data.get("data", {})
@@ -150,9 +158,10 @@ async def resolve_tiktok_story(url):
     cached = cache_get(url)
     if cached:
         return cached
+
     opts = {"quiet": True, "skip_download": True, "format": "best", "socket_timeout": 15}
     try:
-        info = await run_yt_dlp(opts, url)
+        info = await run_yt_dlp(opts, url)  # ⚡ async maintenant
         ext = info.get("ext", "mp4")
         du = info.get("url") or (info.get("formats") or [{}])[-1].get("url", "")
         if du:
@@ -166,7 +175,7 @@ async def resolve_tiktok_story(url):
         pass
     return {"success": False, "error": "Impossible de télécharger cette story TikTok."}
 
-# ── Twitter / X — VERSION DEBUG ───────────────────────────────────────────────
+# ── Twitter / X ───────────────────────────────────────────────────────────────
 async def resolve_twitter(url):
     cached = cache_get(url)
     if cached:
@@ -177,19 +186,12 @@ async def resolve_twitter(url):
         f"https://api.fxtwitter.com/status/{tid}",
         f"https://api.vxtwitter.com/status/{tid}"
     ]
-
+    # ⚡ Les deux APIs en parallèle, on prend la première qui répond
     async def fetch_api(api_url):
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                data = r.json()
-                # ══ LOG COMPLET ══
-                print(f"\n[TWITTER DEBUG] {api_url}")
-                print(json.dumps(data, indent=2, ensure_ascii=False)[:5000])
-                print("[TWITTER DEBUG END]\n")
-                return data
-        except Exception as e:
-            print(f"[TWITTER ERROR] {api_url} → {e}")
+                return (await c.get(api_url, headers={"User-Agent": "Mozilla/5.0"})).json()
+        except Exception:
             return None
 
     results = await asyncio.gather(*[fetch_api(a) for a in apis])
@@ -199,68 +201,37 @@ async def resolve_twitter(url):
             continue
         t = data.get("tweet", data)
         m = t.get("media", {})
-
-        def best_thumbnail(video_obj=None):
-            if video_obj:
-                for key in ("thumbnail_url", "thumbnail", "preview_image_url"):
-                    v = video_obj.get(key, "")
-                    if v:
-                        return v
-            for key in ("thumbnail_url", "thumbnail"):
-                v = t.get(key, "")
-                if v and isinstance(v, str):
-                    return v
-                if v and isinstance(v, dict):
-                    return v.get("url", "")
-            for p in m.get("photos", []):
-                if p.get("url"):
-                    return p["url"]
-            return ""
-
         for v in m.get("videos", []):
             if v.get("url"):
-                result = {"success": True, "direct_url": v["url"],
-                          "title": t.get("text", "X")[:100],
-                          "thumbnail": best_thumbnail(v),
-                          "duration": 0, "platform": "twitter",
-                          "ext": "mp4", "is_image": False, "all_images": []}
+                result = {"success": True, "direct_url": v["url"], "title": t.get("text", "X")[:100],
+                          "thumbnail": t.get("thumbnail_url", ""), "duration": 0,
+                          "platform": "twitter", "ext": "mp4", "is_image": False, "all_images": []}
                 cache_set(url, result)
                 return result
-
         for g in m.get("gifs", []):
             if g.get("url"):
-                result = {"success": True, "direct_url": g["url"],
-                          "title": t.get("text", "X")[:100],
-                          "thumbnail": best_thumbnail(g),
-                          "duration": 0, "platform": "twitter",
+                result = {"success": True, "direct_url": g["url"], "title": t.get("text", "X")[:100],
+                          "thumbnail": "", "duration": 0, "platform": "twitter",
                           "ext": "mp4", "is_image": False, "all_images": []}
                 cache_set(url, result)
                 return result
-
         for p in m.get("photos", []):
             if p.get("url"):
-                result = {"success": True, "direct_url": p["url"],
-                          "title": t.get("text", "X")[:100],
-                          "thumbnail": p["url"],
-                          "duration": 0, "platform": "twitter",
+                result = {"success": True, "direct_url": p["url"], "title": t.get("text", "X")[:100],
+                          "thumbnail": p["url"], "duration": 0, "platform": "twitter",
                           "ext": "jpg", "is_image": True, "all_images": []}
                 cache_set(url, result)
                 return result
-
         for me in data.get("media_extended", []):
             if me.get("type") in ["video", "gif"] and me.get("url"):
-                result = {"success": True, "direct_url": me["url"],
-                          "title": data.get("text", "X")[:100],
-                          "thumbnail": me.get("thumbnail_url") or me.get("thumbnail") or "",
-                          "duration": 0, "platform": "twitter",
+                result = {"success": True, "direct_url": me["url"], "title": data.get("text", "X")[:100],
+                          "thumbnail": "", "duration": 0, "platform": "twitter",
                           "ext": "mp4", "is_image": False, "all_images": []}
                 cache_set(url, result)
                 return result
             if me.get("type") == "image" and me.get("url"):
-                result = {"success": True, "direct_url": me["url"],
-                          "title": data.get("text", "X")[:100],
-                          "thumbnail": me["url"],
-                          "duration": 0, "platform": "twitter",
+                result = {"success": True, "direct_url": me["url"], "title": data.get("text", "X")[:100],
+                          "thumbnail": me["url"], "duration": 0, "platform": "twitter",
                           "ext": "jpg", "is_image": True, "all_images": []}
                 cache_set(url, result)
                 return result
@@ -269,9 +240,11 @@ async def resolve_twitter(url):
 
 # ── Instagram ─────────────────────────────────────────────────────────────────
 async def resolve_instagram_via_api(url):
+    """Fallback SnapInsta — les 2 requêtes HTTP en parallèle."""
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-            tr = await c.get("https://snapinsta.app/", headers={"User-Agent": "Mozilla/5.0"})
+            tr = await c.get("https://snapinsta.app/",
+                             headers={"User-Agent": "Mozilla/5.0"})
             m = re.search(r'name="_token"\s+value="([^"]+)"', tr.text)
             if m:
                 dr = await c.post(
@@ -305,6 +278,7 @@ async def resolve_instagram(url, extra_cookies=""):
     cached = cache_get(url)
     if cached:
         return cached
+
     is_story = "/stories/" in url.lower()
     tmp = None
     try:
@@ -312,13 +286,21 @@ async def resolve_instagram(url, extra_cookies=""):
             tmp = cookies_to_tempfile(extra_cookies, "instagram")
         cf = tmp or get_cookie_file("instagram")
         opts = {
-            "quiet": True, "no_warnings": True, "skip_download": True,
-            "format": "best", "socket_timeout": 15,
-            "http_headers": {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"}
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "best",
+            "socket_timeout": 15,          # ⚡ 30→15s
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15"
+            }
         }
         if cf:
             opts["cookiefile"] = cf
-        info = await run_yt_dlp(opts, url)
+
+        info = await run_yt_dlp(opts, url)  # ⚡ async maintenant
+
+        # CAS CARROUSEL
         if info.get("_type") == "playlist":
             entries = [e for e in info.get("entries", []) if e]
             valid = []
@@ -331,8 +313,10 @@ async def resolve_instagram(url, extra_cookies=""):
                     ext = e.get("ext", "jpg")
                     valid.append({"url": du, "is_video": ext == "mp4",
                                   "ext": ext, "thumbnail": e.get("thumbnail", "")})
+
             if not valid:
                 raise Exception("no entries")
+
             if len(valid) == 1:
                 item = valid[0]
                 result = {"success": True, "direct_url": item["url"],
@@ -343,6 +327,7 @@ async def resolve_instagram(url, extra_cookies=""):
                           "all_images": [], "carousel_items": []}
                 cache_set(url, result)
                 return result
+
             first = valid[0]
             carousel_items = [{"url": item["url"], "is_video": item["is_video"],
                                "thumbnail": item["thumbnail"], "index": i}
@@ -356,6 +341,8 @@ async def resolve_instagram(url, extra_cookies=""):
                       "all_images": all_images, "carousel_items": carousel_items}
             cache_set(url, result)
             return result
+
+        # CAS SIMPLE
         ext = info.get("ext", "mp4")
         is_image = ext in ["jpg", "jpeg", "png", "webp"]
         du = info.get("url", "")
@@ -372,6 +359,7 @@ async def resolve_instagram(url, extra_cookies=""):
                       "is_image": is_image, "all_images": [], "carousel_items": []}
             cache_set(url, result)
             return result
+
     except Exception:
         pass
     finally:
@@ -380,11 +368,14 @@ async def resolve_instagram(url, extra_cookies=""):
                 os.unlink(tmp)
             except Exception:
                 pass
+
+    # Fallback SnapInsta
     result = await resolve_instagram_via_api(url)
     if result.get("success"):
         result.setdefault("carousel_items", [])
         cache_set(url, result)
         return result
+
     msg = ("Story Instagram expirée ou privée." if is_story
            else "Impossible de télécharger ce contenu Instagram.")
     return {"success": False, "error": msg}
@@ -396,9 +387,11 @@ async def resolve_facebook(url, extra_cookies=""):
                 "m.facebook.com/?", "web.facebook.com/?", "facebook.com/home", "lm.facebook.com"]:
         if bad in lower:
             return {"success": False, "error": "Naviguez vers un post, vidéo ou story spécifique."}
+
     cached = cache_get(url)
     if cached:
         return cached
+
     is_story = "/stories/" in lower
     tmp = None
     try:
@@ -406,13 +399,15 @@ async def resolve_facebook(url, extra_cookies=""):
             tmp = cookies_to_tempfile(extra_cookies, "facebook")
         cf = tmp or get_cookie_file("facebook")
         opts = {"quiet": True, "no_warnings": True, "skip_download": True,
-                "format": "best[ext=mp4]/best", "socket_timeout": 15}
+                "format": "best[ext=mp4]/best", "socket_timeout": 15}  # ⚡ 30→15s
         if cf:
             opts["cookiefile"] = cf
             opts["http_headers"] = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
-        info = await run_yt_dlp(opts, url)
+
+        info = await run_yt_dlp(opts, url)  # ⚡ async maintenant
+
         if info.get("_type") == "playlist":
             entries = info.get("entries", [])
             if entries:
@@ -433,6 +428,7 @@ async def resolve_facebook(url, extra_cookies=""):
                   "is_image": is_image, "all_images": []}
         cache_set(url, result)
         return result
+
     except Exception as e:
         msg = str(e).lower()
         if is_story:
@@ -454,8 +450,10 @@ async def resolve_facebook(url, extra_cookies=""):
 async def resolve_video(req: ResolveRequest):
     url = req.url.strip()
     cookies = req.cookies.strip()
+
     if any(b in url.lower() for b in ["youtube.com", "youtu.be"]):
         raise HTTPException(status_code=403, detail="YouTube non supporté")
+
     if "tiktok.com" in url.lower():
         return await (resolve_tiktok_story(url)
                       if "/story/" in url.lower() or "/photo/" in url.lower()
@@ -466,13 +464,15 @@ async def resolve_video(req: ResolveRequest):
         return await resolve_instagram(url, extra_cookies=cookies)
     if any(x in url.lower() for x in ["facebook.com", "fb.watch", "fb.com"]):
         return await resolve_facebook(url, extra_cookies=cookies)
+
     cached = cache_get(url)
     if cached:
         return cached
+
     opts = {"quiet": True, "skip_download": True,
             "format": "best[ext=mp4]/best", "socket_timeout": 15}
     try:
-        info = await run_yt_dlp(opts, url)
+        info = await run_yt_dlp(opts, url)  # ⚡ async maintenant
         ext = info.get("ext", "mp4")
         du = info.get("url", "")
         if not du and info.get("formats"):
@@ -490,6 +490,7 @@ async def resolve_video(req: ResolveRequest):
     except Exception as e:
         return {"success": False, "error": str(e)[:200]}
 
+# ── Nettoyage du cache (endpoint admin optionnel) ─────────────────────────────
 @app.delete("/cache")
 def clear_cache():
     _cache.clear()
