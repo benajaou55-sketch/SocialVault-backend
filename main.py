@@ -16,10 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ── Thread pool dédié à yt-dlp (bloquant) ─────────────────────────────────────
 executor = ThreadPoolExecutor(max_workers=4)
 
+# ── Cache en mémoire simple (url → résultat, TTL 10 min) ──────────────────────
 _cache: dict[str, tuple[float, dict]] = {}
-CACHE_TTL = 600
+CACHE_TTL = 600  # secondes
 
 def cache_get(key: str):
     entry = _cache.get(key)
@@ -32,11 +34,13 @@ def cache_set(key: str, value: dict):
     if value.get("success"):
         _cache[key] = (time.time(), value)
 
+# ── Modèles ───────────────────────────────────────────────────────────────────
 class ResolveRequest(BaseModel):
     url: str
     cookies: str = ""
     platform_hint: str = ""
 
+# ── Fichiers cookies ──────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTAGRAM_COOKIES = os.path.join(BASE_DIR, "www.instagram.com_cookies.txt")
 FACEBOOK_COOKIES  = os.path.join(BASE_DIR, "web.facebook.com_cookies.txt")
@@ -70,6 +74,7 @@ def clean_instagram_url(url):
     url = url.rstrip('?&')
     return url
 
+# ── Wrapper : exécute yt-dlp dans le thread pool ──────────────────────────────
 async def run_yt_dlp(opts: dict, url: str) -> dict:
     def _extract():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -77,14 +82,7 @@ async def run_yt_dlp(opts: dict, url: str) -> dict:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, _extract)
 
-# ── Utilitaire thumbnail ───────────────────────────────────────────────────────
-def best_thumbnail(candidates: list) -> str:
-    """Retourne la première URL non vide parmi les candidats."""
-    for c in candidates:
-        if c and isinstance(c, str) and c.startswith("http"):
-            return c
-    return ""
-
+# ── Routes utilitaires ────────────────────────────────────────────────────────
 @app.get("/")
 def root(): return {"status": "SocialVault Backend running"}
 
@@ -137,47 +135,17 @@ async def resolve_tiktok(url):
         if data.get("code") == 0:
             vd = data.get("data", {})
             imgs = vd.get("images", [])
-
-            # ── Diaporama TikTok ──────────────────────────────────────────────
             if imgs:
-                # thumbnail = première image du diaporama
-                thumb = best_thumbnail([vd.get("cover"), vd.get("origin_cover")] + imgs)
-                result = {
-                    "success": True,
-                    "direct_url": imgs[0],
-                    "title": vd.get("title", "TikTok"),
-                    "thumbnail": thumb,
-                    "duration": 0,
-                    "platform": "tiktok",
-                    "ext": "jpg",
-                    "is_image": True,
-                    "all_images": imgs
-                }
+                result = {"success": True, "direct_url": imgs[0], "title": vd.get("title", "TikTok"),
+                          "thumbnail": imgs[0], "duration": 0, "platform": "tiktok",
+                          "ext": "jpg", "is_image": True, "all_images": imgs}
                 cache_set(url, result)
                 return result
-
-            # ── Vidéo TikTok normale ──────────────────────────────────────────
             play = vd.get("hdplay") or vd.get("play")
             if play:
-                # tikwm retourne cover, origin_cover, ai_dynamic_cover
-                # On prend la meilleure disponible
-                thumb = best_thumbnail([
-                    vd.get("cover"),
-                    vd.get("origin_cover"),
-                    vd.get("ai_dynamic_cover"),
-                    vd.get("dynamic_cover")
-                ])
-                result = {
-                    "success": True,
-                    "direct_url": play,
-                    "title": vd.get("title", "TikTok"),
-                    "thumbnail": thumb,
-                    "duration": vd.get("duration", 0),
-                    "platform": "tiktok",
-                    "ext": "mp4",
-                    "is_image": False,
-                    "all_images": []
-                }
+                result = {"success": True, "direct_url": play, "title": vd.get("title", "TikTok"),
+                          "thumbnail": vd.get("cover", ""), "duration": vd.get("duration", 0),
+                          "platform": "tiktok", "ext": "mp4", "is_image": False, "all_images": []}
                 cache_set(url, result)
                 return result
     except Exception:
@@ -195,21 +163,10 @@ async def resolve_tiktok_story(url):
         ext = info.get("ext", "mp4")
         du = info.get("url") or (info.get("formats") or [{}])[-1].get("url", "")
         if du:
-            thumb = best_thumbnail([
-                info.get("thumbnail"),
-                info.get("thumbnails", [{}])[0].get("url") if info.get("thumbnails") else ""
-            ])
-            result = {
-                "success": True,
-                "direct_url": du,
-                "title": info.get("title", "TikTok Story"),
-                "thumbnail": thumb,
-                "duration": int(info.get("duration") or 0),
-                "platform": "tiktok",
-                "ext": ext,
-                "is_image": ext in ["jpg", "jpeg", "png", "webp"],
-                "all_images": []
-            }
+            result = {"success": True, "direct_url": du, "title": info.get("title", "TikTok Story"),
+                      "thumbnail": info.get("thumbnail", ""), "duration": int(info.get("duration") or 0),
+                      "platform": "tiktok", "ext": ext, "is_image": ext in ["jpg", "jpeg", "png", "webp"],
+                      "all_images": []}
             cache_set(url, result)
             return result
     except Exception:
@@ -243,22 +200,33 @@ async def resolve_twitter(url):
         t = data.get("tweet", data)
         m = t.get("media", {})
 
-        # ── Vidéos ────────────────────────────────────────────────────────────
+        # ── Extraire la meilleure thumbnail disponible ────────────────────────
+        def best_thumbnail(video_obj=None):
+            if video_obj:
+                for key in ("thumbnail_url", "thumbnail", "preview_image_url"):
+                    v = video_obj.get(key, "")
+                    if v:
+                        return v
+            # Thumbnail au niveau du tweet
+            for key in ("thumbnail_url", "thumbnail"):
+                v = t.get(key, "")
+                if v and isinstance(v, str):
+                    return v
+                if v and isinstance(v, dict):
+                    return v.get("url", "")
+            # Première photo du tweet comme fallback
+            for p in m.get("photos", []):
+                if p.get("url"):
+                    return p["url"]
+            return ""
+
         for v in m.get("videos", []):
             if v.get("url"):
-                # thumbnail_url peut être dans le tweet ou dans la vidéo elle-même
-                thumb = best_thumbnail([
-                    t.get("thumbnail_url"),
-                    v.get("thumbnail_url"),
-                    v.get("preview"),
-                    # fxtwitter met parfois la thumbnail dans media.photos[0]
-                    (m.get("photos") or [{}])[0].get("url") if m.get("photos") else ""
-                ])
                 result = {
                     "success": True,
                     "direct_url": v["url"],
                     "title": t.get("text", "X")[:100],
-                    "thumbnail": thumb,
+                    "thumbnail": best_thumbnail(v),
                     "duration": 0,
                     "platform": "twitter",
                     "ext": "mp4",
@@ -268,15 +236,13 @@ async def resolve_twitter(url):
                 cache_set(url, result)
                 return result
 
-        # ── GIFs ──────────────────────────────────────────────────────────────
         for g in m.get("gifs", []):
             if g.get("url"):
-                thumb = best_thumbnail([g.get("thumbnail_url"), g.get("preview")])
                 result = {
                     "success": True,
                     "direct_url": g["url"],
                     "title": t.get("text", "X")[:100],
-                    "thumbnail": thumb,
+                    "thumbnail": best_thumbnail(g),
                     "duration": 0,
                     "platform": "twitter",
                     "ext": "mp4",
@@ -286,7 +252,6 @@ async def resolve_twitter(url):
                 cache_set(url, result)
                 return result
 
-        # ── Photos ────────────────────────────────────────────────────────────
         for p in m.get("photos", []):
             if p.get("url"):
                 result = {
@@ -303,19 +268,13 @@ async def resolve_twitter(url):
                 cache_set(url, result)
                 return result
 
-        # ── media_extended (vxtwitter) ─────────────────────────────────────
         for me in data.get("media_extended", []):
             if me.get("type") in ["video", "gif"] and me.get("url"):
-                thumb = best_thumbnail([
-                    me.get("thumbnail_url"),
-                    me.get("preview"),
-                    data.get("thumbnail_url")
-                ])
                 result = {
                     "success": True,
                     "direct_url": me["url"],
                     "title": data.get("text", "X")[:100],
-                    "thumbnail": thumb,
+                    "thumbnail": me.get("thumbnail_url") or me.get("thumbnail") or "",
                     "duration": 0,
                     "platform": "twitter",
                     "ext": "mp4",
@@ -324,6 +283,7 @@ async def resolve_twitter(url):
                 }
                 cache_set(url, result)
                 return result
+
             if me.get("type") == "image" and me.get("url"):
                 result = {
                     "success": True,
@@ -483,8 +443,7 @@ async def resolve_instagram(url, extra_cookies=""):
 async def resolve_facebook(url, extra_cookies=""):
     lower = url.lower()
     for bad in ["checkpoint", "login.php", "/login", "facebook.com/?",
-                "m.facebook.com/?", "web.facebook.com/?", "facebook.com/home",
-                "lm.facebook.com"]:
+                "m.facebook.com/?", "web.facebook.com/?", "facebook.com/home", "lm.facebook.com"]:
         if bad in lower:
             return {"success": False, "error": "Naviguez vers un post, vidéo ou story spécifique."}
 
@@ -521,8 +480,7 @@ async def resolve_facebook(url, extra_cookies=""):
             du = mp4s[-1]["url"] if mp4s else fmts[-1].get("url", "")
         if not du:
             raise Exception("no url")
-        result = {"success": True, "direct_url": du,
-                  "title": info.get("title", "Facebook"),
+        result = {"success": True, "direct_url": du, "title": info.get("title", "Facebook"),
                   "thumbnail": info.get("thumbnail", ""),
                   "duration": int(info.get("duration") or 0),
                   "platform": "facebook", "ext": ext,
@@ -581,18 +539,17 @@ async def resolve_video(req: ResolveRequest):
             du = mp4s[-1]["url"] if mp4s else info["formats"][-1].get("url", "")
         if not du:
             return {"success": False, "error": "Impossible de résoudre cette URL"}
-        result = {"success": True, "direct_url": du,
-                  "title": info.get("title", "Media"),
+        result = {"success": True, "direct_url": du, "title": info.get("title", "Media"),
                   "thumbnail": info.get("thumbnail", ""),
                   "duration": int(info.get("duration") or 0),
                   "platform": "unknown", "ext": ext,
-                  "is_image": ext in ["jpg", "jpeg", "png", "webp"],
-                  "all_images": []}
+                  "is_image": ext in ["jpg", "jpeg", "png", "webp"], "all_images": []}
         cache_set(url, result)
         return result
     except Exception as e:
         return {"success": False, "error": str(e)[:200]}
 
+# ── Nettoyage du cache ────────────────────────────────────────────────────────
 @app.delete("/cache")
 def clear_cache():
     _cache.clear()
