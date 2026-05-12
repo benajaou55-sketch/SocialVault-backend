@@ -144,6 +144,57 @@ async def download_video(url: str):
     return StreamingResponse(stream(), media_type="video/mp4",
                              headers={"Content-Disposition": "attachment; filename=video.mp4"})
 
+# ── TikTok : résolution des liens courts Samsung (vt.tiktok.com / vm.tiktok.com) ──
+async def expand_tiktok_short_url(url: str) -> str:
+    """
+    Samsung partage des liens courts vt.tiktok.com au lieu des liens longs.
+    tikwm et tikmate échouent sur ces liens courts → on les résout d'abord.
+    On suit les redirections HTTP pour obtenir l'URL longue tiktok.com/@user/video/ID
+    """
+    short_domains = ["vt.tiktok.com", "vm.tiktok.com", "m.tiktok.com"]
+    if not any(d in url for d in short_domains):
+        return url  # déjà un lien long → rien à faire
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Mobile Safari/537.36"
+    }
+
+    # Tentative 1 : HEAD (rapide, ne télécharge pas le contenu)
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True,
+                                     headers=headers) as c:
+            r = await c.head(url)
+            resolved = str(r.url)
+            if "tiktok.com" in resolved and "/video/" in resolved:
+                clean = resolved.split("?")[0].rstrip("/")
+                return clean
+    except Exception:
+        pass
+
+    # Tentative 2 : GET (plus lent mais plus fiable)
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                                     headers=headers) as c:
+            r = await c.get(url)
+            resolved = str(r.url)
+            if "tiktok.com" in resolved and "/video/" in resolved:
+                clean = resolved.split("?")[0].rstrip("/")
+                return clean
+            # Chercher l'URL longue dans le contenu HTML si la redirection
+            # renvoie une page intermédiaire
+            m = re.search(
+                r'https://www\.tiktok\.com/@[^/]+/video/\d+',
+                r.text
+            )
+            if m:
+                return m.group(0)
+    except Exception:
+        pass
+
+    return url  # fallback : on retourne l'URL originale, tikwm tentera quand même
+
 # ── TikTok ────────────────────────────────────────────────────────────────────
 async def _tiktok_tikwm(url: str) -> dict:
     """API tikwm — rapide, tente HD puis SD."""
@@ -173,7 +224,6 @@ async def _tiktok_tikmate(url: str) -> dict:
             r = await c.post("https://tikmate.online/api/", data={"url": url},
                              headers={"User-Agent": "Mozilla/5.0"})
             data = r.json()
-        # tikmate retourne {"status": "ok", "video": [...]}
         videos = data.get("video", [])
         if videos:
             best = videos[0].get("url", "")
@@ -206,10 +256,14 @@ async def _tiktok_ytdlp(url: str) -> dict:
     return {"success": False, "error": "yt-dlp tiktok failed"}
 
 async def resolve_tiktok(url):
+    # ⚡ Résolution du lien court Samsung AVANT tout appel API
+    url = await expand_tiktok_short_url(url)
+
     cached = cache_get(url)
     if cached:
         return cached
-    # ⚡ tikwm + tikmate en parallèle, yt-dlp seulement si les deux échouent
+
+    # tikwm + tikmate en parallèle, yt-dlp seulement si les deux échouent
     result = await first_success(_tiktok_tikwm(url), _tiktok_tikmate(url))
     if not result.get("success"):
         result = await _tiktok_ytdlp(url)
@@ -217,10 +271,13 @@ async def resolve_tiktok(url):
     return result
 
 async def resolve_tiktok_story(url):
+    # ⚡ Résolution du lien court Samsung AVANT tout appel API
+    url = await expand_tiktok_short_url(url)
+
     cached = cache_get(url)
     if cached:
         return cached
-    # Stories : tikwm d'abord (gère aussi les photos), puis yt-dlp
+
     result = await first_success(_tiktok_tikwm(url), _tiktok_ytdlp(url))
     if result.get("success"):
         cache_set(url, result)
