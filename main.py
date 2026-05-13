@@ -774,7 +774,16 @@ async def resolve_video(req: ResolveRequest):
 
     # ⚡ Timeout global de sécurité : 25s max par requête
     try:
-        if "tiktok.com" in url.lower():
+        # Détecter les liens courts TikTok non résolvables depuis Render
+    short_tiktok_domains = ["vt.tiktok.com", "vm.tiktok.com"]
+    if any(d in url.lower() for d in short_tiktok_domains):
+        return {
+            "success": False,
+            "error": "LIEN_COURT_TIKTOK",
+            "short_url": True
+        }
+
+    if "tiktok.com" in url.lower():
             coro = (resolve_tiktok_story(url)
                     if "/story/" in url.lower() or "/photo/" in url.lower()
                     else resolve_tiktok(url))
