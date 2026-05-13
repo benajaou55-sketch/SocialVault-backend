@@ -196,23 +196,80 @@ async def expand_tiktok_short_url(url: str) -> str:
     return url  # fallback : on retourne l'URL originale, tikwm tentera quand même
 
 # ── TikTok ────────────────────────────────────────────────────────────────────
+async def _verify_video_url(url: str) -> bool:
+    """
+    Vérifie qu'une URL pointe vers une vraie vidéo (pas un fichier audio).
+    tikwm retourne parfois hdplay = fichier M4A (audio only) déguisé en .mp4
+    → Android le détecte comme audio et le met dans Musique au lieu de Vidéo.
+    On fait un HEAD pour vérifier le Content-Type et la taille.
+    """
+    if not url:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
+            r = await c.head(url, headers={"User-Agent": "Mozilla/5.0"})
+        ct = r.headers.get("content-type", "").lower()
+        cl = int(r.headers.get("content-length", "0") or "0")
+        # Un fichier audio (m4a, aac) ne doit pas passer
+        is_audio_only = any(x in ct for x in ["audio/", "application/octet-stream"])
+        # Une vraie vidéo TikTok fait au moins 500KB
+        too_small = 0 < cl < 500_000
+        if is_audio_only or too_small:
+            return False
+        return True
+    except Exception:
+        # En cas d'erreur réseau on laisse passer (optimiste)
+        return True
+
 async def _tiktok_tikwm(url: str) -> dict:
-    """API tikwm — rapide, tente HD puis SD."""
+    """
+    API tikwm — vérifie que hdplay est une vraie vidéo.
+    Problème connu : hdplay retourne parfois un M4A (audio only)
+    que Android classe dans Musique au lieu de Vidéo.
+    On vérifie le Content-Type avant de retourner l'URL.
+    """
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             data = (await c.get(f"https://tikwm.com/api/?url={url}&hd=1")).json()
         if data.get("code") == 0:
             vd = data.get("data", {})
+
+            # Cas diaporama (images)
             imgs = vd.get("images", [])
             if imgs:
                 return {"success": True, "direct_url": imgs[0], "title": vd.get("title", "TikTok"),
                         "thumbnail": imgs[0], "duration": 0, "platform": "tiktok",
                         "ext": "jpg", "is_image": True, "all_images": imgs}
-            play = vd.get("hdplay") or vd.get("play")
+
+            hdplay = vd.get("hdplay", "")
+            play   = vd.get("play", "")
+            title  = vd.get("title", "TikTok")
+            cover  = vd.get("cover", "")
+            dur    = vd.get("duration", 0)
+
+            # ⚡ Vérifier hdplay en priorité
+            if hdplay:
+                is_real_video = await _verify_video_url(hdplay)
+                if is_real_video:
+                    return {"success": True, "direct_url": hdplay, "title": title,
+                            "thumbnail": cover, "duration": dur,
+                            "platform": "tiktok", "ext": "mp4", "is_image": False, "all_images": []}
+                # hdplay est audio-only → essayer play (SD)
+
+            # ⚡ Fallback sur play (SD) si hdplay est un audio
             if play:
-                return {"success": True, "direct_url": play, "title": vd.get("title", "TikTok"),
-                        "thumbnail": vd.get("cover", ""), "duration": vd.get("duration", 0),
+                is_real_video = await _verify_video_url(play)
+                if is_real_video:
+                    return {"success": True, "direct_url": play, "title": title,
+                            "thumbnail": cover, "duration": dur,
+                            "platform": "tiktok", "ext": "mp4", "is_image": False, "all_images": []}
+
+            # Dernier recours : retourner play sans vérification
+            if play:
+                return {"success": True, "direct_url": play, "title": title,
+                        "thumbnail": cover, "duration": dur,
                         "platform": "tiktok", "ext": "mp4", "is_image": False, "all_images": []}
+
     except Exception:
         pass
     return {"success": False, "error": "tikwm failed"}
@@ -255,33 +312,44 @@ async def _tiktok_ytdlp(url: str) -> dict:
         pass
     return {"success": False, "error": "yt-dlp tiktok failed"}
 
-async def resolve_tiktok(url):
-    # ⚡ Résolution du lien court Samsung AVANT tout appel API
-    url = await expand_tiktok_short_url(url)
+def _is_short_tiktok(url: str) -> bool:
+    return any(d in url for d in ["vt.tiktok.com", "vm.tiktok.com", "m.tiktok.com"])
 
+async def resolve_tiktok(url):
     cached = cache_get(url)
     if cached:
         return cached
 
-    # tikwm + tikmate en parallèle, yt-dlp seulement si les deux échouent
-    result = await first_success(_tiktok_tikwm(url), _tiktok_tikmate(url))
-    if not result.get("success"):
+    # vt.tiktok.com retourne 403 a TOUS les serveurs (Render, tikwm, etc.)
+    # yt-dlp est le seul outil qui resout ces liens nativement.
+    if _is_short_tiktok(url):
         result = await _tiktok_ytdlp(url)
+        if not result.get("success"):
+            result = await first_success(_tiktok_tikwm(url), _tiktok_tikmate(url))
+    else:
+        result = await first_success(_tiktok_tikwm(url), _tiktok_tikmate(url))
+        if not result.get("success"):
+            result = await _tiktok_ytdlp(url)
+
     cache_set(url, result)
     return result
 
 async def resolve_tiktok_story(url):
-    # ⚡ Résolution du lien court Samsung AVANT tout appel API
-    url = await expand_tiktok_short_url(url)
-
     cached = cache_get(url)
     if cached:
         return cached
 
-    result = await first_success(_tiktok_tikwm(url), _tiktok_ytdlp(url))
+    if _is_short_tiktok(url):
+        result = await _tiktok_ytdlp(url)
+        if not result.get("success"):
+            result = await _tiktok_tikwm(url)
+    else:
+        result = await first_success(_tiktok_tikwm(url), _tiktok_ytdlp(url))
+
     if result.get("success"):
         cache_set(url, result)
-    return result if result.get("success") else {"success": False, "error": "Impossible de télécharger cette story TikTok."}
+        return result
+    return {"success": False, "error": "Impossible de telecharger cette story TikTok."}
 
 # ── Twitter / X ───────────────────────────────────────────────────────────────
 def _best_twitter_thumbnail(t: dict, tid: str, video_url: str = "") -> str:
