@@ -337,22 +337,29 @@ async def resolve_tiktok_story(url):
     return {"success": False, "error": "Impossible de telecharger cette story TikTok."}
 
 # ── Twitter / X ───────────────────────────────────────────────────────────────
-def _best_twitter_thumbnail(t: dict, tid: str, video_url: str = "") -> str:
-    m = t.get("media", {})
-    for v in m.get("videos", []):
-        th = v.get("thumbnail_url", "")
-        if th:
-            return th
-    th = t.get("thumbnail_url", "")
+def _get_twitter_thumbnail(v: dict, t: dict, tid: str) -> str:
+    """
+    Cascade à 4 niveaux pour garantir une thumbnail toujours valide.
+    Niveau 1 : thumbnail_url sur l'objet vidéo/gif (champ direct fxtwitter)
+    Niveau 2 : première photo du tweet (souvent la preview de la vidéo)
+    Niveau 3 : pbs.twimg avec l'ID de la VIDÉO (pas du tweet → évite le carré gris)
+    Niveau 4 : avatar de l'auteur (toujours une image valide, jamais vide)
+    """
+    # Niveau 1
+    th = v.get("thumbnail_url", "")
     if th:
         return th
-    for p in m.get("photos", []):
+    # Niveau 2
+    for p in t.get("media", {}).get("photos", []):
         ph = p.get("url", "")
         if ph:
             return ph
-    if tid:
-        return f"https://pbs.twimg.com/tweet_video_thumb/{tid}.jpg"
-    return ""
+    # Niveau 3 — ID de la vidéo, pas du tweet
+    vid_id = v.get("id", "")
+    if vid_id:
+        return f"https://pbs.twimg.com/tweet_video_thumb/{vid_id}.jpg"
+    # Niveau 4 — avatar auteur, toujours disponible
+    return t.get("author", {}).get("avatar_url", "")
 
 async def resolve_twitter(url):
     cached = cache_get(url)
@@ -361,9 +368,6 @@ async def resolve_twitter(url):
 
     tid = url.rstrip("/").split("/")[-1].split("?")[0]
 
-    # ── [FIX #2] Injection des cookies Twitter dans yt-dlp ────────────────────
-    # fxtwitter/vxtwitter restent la source principale (pas besoin de cookies).
-    # yt-dlp en fallback utilise twitter_cookies.txt pour éviter le blocage cloud.
     async def fetch_api(api_url):
         try:
             async with httpx.AsyncClient(timeout=10) as c:
@@ -382,44 +386,77 @@ async def resolve_twitter(url):
         t = data.get("tweet", data)
         m = t.get("media", {})
 
+        # ── Vidéos ────────────────────────────────────────────────────────────
         for v in m.get("videos", []):
-            if v.get("url"):
-                thumbnail = v.get("thumbnail_url") or _best_twitter_thumbnail(t, tid, v["url"])
-                result = {"success": True, "direct_url": v["url"], "title": t.get("text", "X")[:100],
-                          "thumbnail": thumbnail, "duration": 0,
-                          "platform": "twitter", "ext": "mp4", "is_image": False, "all_images": []}
-                cache_set(url, result)
-                return result
+            video_url = v.get("url", "")
+            if not video_url:
+                continue
+            thumbnail = _get_twitter_thumbnail(v, t, tid)
+            result = {
+                "success": True, "direct_url": video_url,
+                "title": t.get("text", "X")[:100],
+                "thumbnail": thumbnail,
+                "duration": int(v.get("duration", 0) or 0),
+                "platform": "twitter", "ext": "mp4", "is_image": False, "all_images": []
+            }
+            cache_set(url, result)
+            return result
 
+        # ── GIFs ──────────────────────────────────────────────────────────────
         for g in m.get("gifs", []):
-            if g.get("url"):
-                thumbnail = g.get("thumbnail_url") or _best_twitter_thumbnail(t, tid)
-                result = {"success": True, "direct_url": g["url"], "title": t.get("text", "X")[:100],
-                          "thumbnail": thumbnail, "duration": 0, "platform": "twitter",
-                          "ext": "mp4", "is_image": False, "all_images": []}
-                cache_set(url, result)
-                return result
+            gif_url = g.get("url", "")
+            if not gif_url:
+                continue
+            thumbnail = _get_twitter_thumbnail(g, t, tid)
+            result = {
+                "success": True, "direct_url": gif_url,
+                "title": t.get("text", "X")[:100],
+                "thumbnail": thumbnail,
+                "duration": 0,
+                "platform": "twitter", "ext": "mp4", "is_image": False, "all_images": []
+            }
+            cache_set(url, result)
+            return result
 
+        # ── Photos ────────────────────────────────────────────────────────────
         for p in m.get("photos", []):
-            if p.get("url"):
-                result = {"success": True, "direct_url": p["url"], "title": t.get("text", "X")[:100],
-                          "thumbnail": p["url"], "duration": 0, "platform": "twitter",
-                          "ext": "jpg", "is_image": True, "all_images": []}
-                cache_set(url, result)
-                return result
+            photo_url = p.get("url", "")
+            if not photo_url:
+                continue
+            result = {
+                "success": True, "direct_url": photo_url,
+                "title": t.get("text", "X")[:100],
+                "thumbnail": photo_url,
+                "duration": 0,
+                "platform": "twitter", "ext": "jpg", "is_image": True, "all_images": []
+            }
+            cache_set(url, result)
+            return result
 
+        # ── media_extended (vxtwitter) ────────────────────────────────────────
         for me in data.get("media_extended", []):
-            if me.get("type") in ["video", "gif"] and me.get("url"):
-                thumbnail = me.get("thumbnail_url") or _best_twitter_thumbnail(t, tid)
-                result = {"success": True, "direct_url": me["url"], "title": data.get("text", "X")[:100],
-                          "thumbnail": thumbnail, "duration": 0, "platform": "twitter",
-                          "ext": "mp4", "is_image": False, "all_images": []}
+            me_url = me.get("url", "")
+            if not me_url:
+                continue
+            if me.get("type") in ["video", "gif"]:
+                thumbnail = _get_twitter_thumbnail(me, t, tid)
+                result = {
+                    "success": True, "direct_url": me_url,
+                    "title": data.get("text", "X")[:100],
+                    "thumbnail": thumbnail,
+                    "duration": 0,
+                    "platform": "twitter", "ext": "mp4", "is_image": False, "all_images": []
+                }
                 cache_set(url, result)
                 return result
-            if me.get("type") == "image" and me.get("url"):
-                result = {"success": True, "direct_url": me["url"], "title": data.get("text", "X")[:100],
-                          "thumbnail": me["url"], "duration": 0, "platform": "twitter",
-                          "ext": "jpg", "is_image": True, "all_images": []}
+            if me.get("type") == "image":
+                result = {
+                    "success": True, "direct_url": me_url,
+                    "title": data.get("text", "X")[:100],
+                    "thumbnail": me_url,
+                    "duration": 0,
+                    "platform": "twitter", "ext": "jpg", "is_image": True, "all_images": []
+                }
                 cache_set(url, result)
                 return result
 
@@ -433,7 +470,7 @@ async def resolve_twitter(url):
         }
         cf = get_cookie_file("twitter")
         if cf:
-            opts["cookiefile"] = cf  # [FIX #2] cookies Twitter injectés ici
+            opts["cookiefile"] = cf
         info = await run_yt_dlp(opts, url)
         ext = info.get("ext", "mp4")
         du = info.get("url", "")
@@ -441,12 +478,16 @@ async def resolve_twitter(url):
             mp4s = [f for f in info["formats"] if f.get("ext") == "mp4" and f.get("url")]
             du = mp4s[-1]["url"] if mp4s else info["formats"][-1].get("url", "")
         if du:
-            result = {"success": True, "direct_url": du,
-                      "title": info.get("title", "X")[:100],
-                      "thumbnail": info.get("thumbnail", ""),
-                      "duration": int(info.get("duration") or 0),
-                      "platform": "twitter", "ext": ext,
-                      "is_image": ext in ["jpg", "jpeg", "png", "webp"], "all_images": []}
+            # yt-dlp retourne la thumbnail directement dans info
+            thumbnail = info.get("thumbnail", "") or t.get("author", {}).get("avatar_url", "")
+            result = {
+                "success": True, "direct_url": du,
+                "title": info.get("title", "X")[:100],
+                "thumbnail": thumbnail,
+                "duration": int(info.get("duration") or 0),
+                "platform": "twitter", "ext": ext,
+                "is_image": ext in ["jpg", "jpeg", "png", "webp"], "all_images": []
+            }
             cache_set(url, result)
             return result
     except Exception:
