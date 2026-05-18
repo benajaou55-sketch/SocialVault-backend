@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import yt_dlp
 import uvicorn
@@ -45,13 +44,25 @@ INSTAGRAM_COOKIES = os.path.join(BASE_DIR, "www.instagram.com_cookies.txt")
 FACEBOOK_COOKIES  = os.path.join(BASE_DIR, "web.facebook.com_cookies.txt")
 TIKTOK_COOKIES    = os.path.join(BASE_DIR, "www.tiktok.com_cookies.txt")
 
+# ── [FIX #2] Cookies Twitter/X ────────────────────────────────────────────────
+# Vercel tourne sur des serveurs cloud US → X bloque les requêtes anonymes.
+# Créez twitter_cookies.txt depuis votre navigateur (extension "Get cookies.txt")
+# et ajoutez-le à la racine du dépôt GitHub.
+TWITTER_COOKIES = os.path.join(BASE_DIR, "twitter_cookies.txt")
+
 def get_cookie_file(platform):
-    m = {"instagram": INSTAGRAM_COOKIES, "facebook": FACEBOOK_COOKIES, "tiktok": TIKTOK_COOKIES}
+    m = {
+        "instagram": INSTAGRAM_COOKIES,
+        "facebook":  FACEBOOK_COOKIES,
+        "tiktok":    TIKTOK_COOKIES,
+        "twitter":   TWITTER_COOKIES,   # [FIX #2] ajout Twitter
+    }
     p = m.get(platform)
     return p if p and os.path.exists(p) else None
 
 def cookies_to_tempfile(cookies_str, platform):
-    domain = {"instagram": ".instagram.com", "facebook": ".facebook.com"}.get(platform, f".{platform}.com")
+    domain = {"instagram": ".instagram.com", "facebook": ".facebook.com",
+               "twitter": ".twitter.com"}.get(platform, f".{platform}.com")
     lines = ["# Netscape HTTP Cookie File\n"]
     for pair in cookies_str.split(";"):
         pair = pair.strip()
@@ -83,8 +94,6 @@ async def run_yt_dlp(opts: dict, url: str) -> dict:
 
 # ── Helper : première tâche qui réussit parmi plusieurs ───────────────────────
 async def first_success(*coros):
-    """Lance toutes les coroutines en parallèle, retourne le premier résultat
-    avec success=True. Retourne le dernier résultat si aucun ne réussit."""
     tasks = [asyncio.ensure_future(c) for c in coros]
     last = {"success": False, "error": "Aucune source disponible"}
     pending = set(tasks)
@@ -94,7 +103,6 @@ async def first_success(*coros):
             try:
                 r = t.result()
                 if r and r.get("success"):
-                    # Annuler les tâches restantes
                     for p in pending:
                         p.cancel()
                     return r
@@ -134,22 +142,26 @@ async def set_cookies(request: Request):
     except Exception as e:
         return {"success": False, "error": str(e)[:100]}
 
-@app.get("/download")
-async def download_video(url: str):
-    async def stream():
-        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-            async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-                async for chunk in r.aiter_bytes(8192):
-                    yield chunk
-    return StreamingResponse(stream(), media_type="video/mp4",
-                             headers={"Content-Disposition": "attachment; filename=video.mp4"})
+# ── [FIX #3] Route /download supprimée (causait des 504 sur Vercel) ────────────
+# L'application Android télécharge directement depuis l'URL CDN retournée par /resolve.
+# Si vous avez besoin de cette route pour tests locaux uniquement, décommentez :
+#
+# from fastapi.responses import StreamingResponse
+# @app.get("/download")
+# async def download_video(url: str):
+#     async def stream():
+#         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+#             async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as r:
+#                 async for chunk in r.aiter_bytes(8192):
+#                     yield chunk
+#     return StreamingResponse(stream(), media_type="video/mp4",
+#                              headers={"Content-Disposition": "attachment; filename=video.mp4"})
 
-# ── TikTok : résolution des liens courts Samsung (vt.tiktok.com / vm.tiktok.com) ──
+# ── TikTok : résolution des liens courts (vt.tiktok.com / vm.tiktok.com) ──────
 async def expand_tiktok_short_url(url: str) -> str:
     """
-    Samsung partage des liens courts vt.tiktok.com au lieu des liens longs.
-    tikwm et tikmate échouent sur ces liens courts → on les résout d'abord.
-    On suit les redirections HTTP pour obtenir l'URL longue tiktok.com/@user/video/ID
+    Samsung et d'autres appareils partagent des liens courts vt.tiktok.com.
+    On suit les redirections HTTP pour obtenir l'URL longue tiktok.com/@user/video/ID.
     """
     short_domains = ["vt.tiktok.com", "vm.tiktok.com", "m.tiktok.com"]
     if not any(d in url for d in short_domains):
@@ -163,46 +175,31 @@ async def expand_tiktok_short_url(url: str) -> str:
 
     # Tentative 1 : HEAD (rapide, ne télécharge pas le contenu)
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True,
-                                     headers=headers) as c:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True, headers=headers) as c:
             r = await c.head(url)
             resolved = str(r.url)
             if "tiktok.com" in resolved and "/video/" in resolved:
-                clean = resolved.split("?")[0].rstrip("/")
-                return clean
+                return resolved.split("?")[0].rstrip("/")
     except Exception:
         pass
 
     # Tentative 2 : GET (plus lent mais plus fiable)
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
-                                     headers=headers) as c:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=headers) as c:
             r = await c.get(url)
             resolved = str(r.url)
             if "tiktok.com" in resolved and "/video/" in resolved:
-                clean = resolved.split("?")[0].rstrip("/")
-                return clean
-            # Chercher l'URL longue dans le contenu HTML si la redirection
-            # renvoie une page intermédiaire
-            m = re.search(
-                r'https://www\.tiktok\.com/@[^/]+/video/\d+',
-                r.text
-            )
+                return resolved.split("?")[0].rstrip("/")
+            m = re.search(r'https://www\.tiktok\.com/@[^/]+/video/\d+', r.text)
             if m:
                 return m.group(0)
     except Exception:
         pass
 
-    return url  # fallback : on retourne l'URL originale, tikwm tentera quand même
+    return url  # fallback : yt-dlp tentera quand même
 
 # ── TikTok ────────────────────────────────────────────────────────────────────
 async def _verify_video_url(url: str) -> bool:
-    """
-    Vérifie qu'une URL pointe vers une vraie vidéo (pas un fichier audio).
-    tikwm retourne parfois hdplay = fichier M4A (audio only) déguisé en .mp4
-    → Android le détecte comme audio et le met dans Musique au lieu de Vidéo.
-    On fait un HEAD pour vérifier le Content-Type et la taille.
-    """
     if not url:
         return False
     try:
@@ -210,72 +207,49 @@ async def _verify_video_url(url: str) -> bool:
             r = await c.head(url, headers={"User-Agent": "Mozilla/5.0"})
         ct = r.headers.get("content-type", "").lower()
         cl = int(r.headers.get("content-length", "0") or "0")
-        # Un fichier audio (m4a, aac) ne doit pas passer
         is_audio_only = any(x in ct for x in ["audio/", "application/octet-stream"])
-        # Une vraie vidéo TikTok fait au moins 500KB
         too_small = 0 < cl < 500_000
         if is_audio_only or too_small:
             return False
         return True
     except Exception:
-        # En cas d'erreur réseau on laisse passer (optimiste)
         return True
 
 async def _tiktok_tikwm(url: str) -> dict:
-    """
-    API tikwm — vérifie que hdplay est une vraie vidéo.
-    Problème connu : hdplay retourne parfois un M4A (audio only)
-    que Android classe dans Musique au lieu de Vidéo.
-    On vérifie le Content-Type avant de retourner l'URL.
-    """
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             data = (await c.get(f"https://tikwm.com/api/?url={url}&hd=1")).json()
         if data.get("code") == 0:
             vd = data.get("data", {})
-
-            # Cas diaporama (images)
             imgs = vd.get("images", [])
             if imgs:
                 return {"success": True, "direct_url": imgs[0], "title": vd.get("title", "TikTok"),
                         "thumbnail": imgs[0], "duration": 0, "platform": "tiktok",
                         "ext": "jpg", "is_image": True, "all_images": imgs}
-
             hdplay = vd.get("hdplay", "")
             play   = vd.get("play", "")
             title  = vd.get("title", "TikTok")
             cover  = vd.get("cover", "")
             dur    = vd.get("duration", 0)
-
-            # ⚡ Vérifier hdplay en priorité
             if hdplay:
-                is_real_video = await _verify_video_url(hdplay)
-                if is_real_video:
+                if await _verify_video_url(hdplay):
                     return {"success": True, "direct_url": hdplay, "title": title,
                             "thumbnail": cover, "duration": dur,
                             "platform": "tiktok", "ext": "mp4", "is_image": False, "all_images": []}
-                # hdplay est audio-only → essayer play (SD)
-
-            # ⚡ Fallback sur play (SD) si hdplay est un audio
             if play:
-                is_real_video = await _verify_video_url(play)
-                if is_real_video:
+                if await _verify_video_url(play):
                     return {"success": True, "direct_url": play, "title": title,
                             "thumbnail": cover, "duration": dur,
                             "platform": "tiktok", "ext": "mp4", "is_image": False, "all_images": []}
-
-            # Dernier recours : retourner play sans vérification
             if play:
                 return {"success": True, "direct_url": play, "title": title,
                         "thumbnail": cover, "duration": dur,
                         "platform": "tiktok", "ext": "mp4", "is_image": False, "all_images": []}
-
     except Exception:
         pass
     return {"success": False, "error": "tikwm failed"}
 
 async def _tiktok_tikmate(url: str) -> dict:
-    """API tikmate — fallback parallèle."""
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
             r = await c.post("https://tikmate.online/api/", data={"url": url},
@@ -293,7 +267,6 @@ async def _tiktok_tikmate(url: str) -> dict:
     return {"success": False, "error": "tikmate failed"}
 
 async def _tiktok_ytdlp(url: str) -> dict:
-    """yt-dlp comme dernier recours."""
     try:
         opts = {"quiet": True, "skip_download": True, "format": "best",
                 "socket_timeout": 8, "retries": 1}
@@ -320,12 +293,21 @@ async def resolve_tiktok(url):
     if cached:
         return cached
 
-    # vt.tiktok.com retourne 403 a TOUS les serveurs (Render, tikwm, etc.)
-    # yt-dlp est le seul outil qui resout ces liens nativement.
+    # ── [FIX #1] Résolution automatique des liens courts ──────────────────────
+    # AVANT : on renvoyait LIEN_COURT_TIKTOK et on bloquait l'utilisateur.
+    # MAINTENANT : on résout le lien court en lien long, puis on extrait normalement.
     if _is_short_tiktok(url):
-        result = await _tiktok_ytdlp(url)
-        if not result.get("success"):
-            result = await first_success(_tiktok_tikwm(url), _tiktok_tikmate(url))
+        expanded = await expand_tiktok_short_url(url)
+        # Si expand a réussi, on utilise le lien long avec tikwm/tikmate en priorité
+        if expanded != url and "/video/" in expanded:
+            result = await first_success(_tiktok_tikwm(expanded), _tiktok_tikmate(expanded))
+            if not result.get("success"):
+                result = await _tiktok_ytdlp(expanded)
+        else:
+            # expand a échoué → yt-dlp gère les liens courts nativement
+            result = await _tiktok_ytdlp(url)
+            if not result.get("success"):
+                result = await first_success(_tiktok_tikwm(url), _tiktok_tikmate(url))
     else:
         result = await first_success(_tiktok_tikwm(url), _tiktok_tikmate(url))
         if not result.get("success"):
@@ -339,10 +321,13 @@ async def resolve_tiktok_story(url):
     if cached:
         return cached
 
+    # [FIX #1] Même logique pour les stories avec liens courts
     if _is_short_tiktok(url):
-        result = await _tiktok_ytdlp(url)
+        expanded = await expand_tiktok_short_url(url)
+        work_url = expanded if expanded != url else url
+        result = await _tiktok_ytdlp(work_url)
         if not result.get("success"):
-            result = await _tiktok_tikwm(url)
+            result = await _tiktok_tikwm(work_url)
     else:
         result = await first_success(_tiktok_tikwm(url), _tiktok_ytdlp(url))
 
@@ -353,38 +338,20 @@ async def resolve_tiktok_story(url):
 
 # ── Twitter / X ───────────────────────────────────────────────────────────────
 def _best_twitter_thumbnail(t: dict, tid: str, video_url: str = "") -> str:
-    """Extrait la meilleure thumbnail disponible depuis les données fxtwitter/vxtwitter.
-
-    Ordre de priorité :
-    1. thumbnail_url sur la vidéo elle-même  (fxtwitter : media.videos[].thumbnail_url)
-    2. thumbnail_url du tweet                (t["thumbnail_url"])
-    3. Première photo dans media.photos      (souvent la preview de la vidéo)
-    4. URL construite pbs.twimg.com depuis le tid
-    5. Chaîne vide si rien ne fonctionne
-    """
     m = t.get("media", {})
-
-    # 1. thumbnail directe sur la vidéo
     for v in m.get("videos", []):
         th = v.get("thumbnail_url", "")
         if th:
             return th
-
-    # 2. thumbnail_url globale du tweet
     th = t.get("thumbnail_url", "")
     if th:
         return th
-
-    # 3. Première photo comme preview
     for p in m.get("photos", []):
         ph = p.get("url", "")
         if ph:
             return ph
-
-    # 4. URL construite depuis l'ID du tweet (Twitter héberge toujours cette image)
     if tid:
         return f"https://pbs.twimg.com/tweet_video_thumb/{tid}.jpg"
-
     return ""
 
 async def resolve_twitter(url):
@@ -394,6 +361,9 @@ async def resolve_twitter(url):
 
     tid = url.rstrip("/").split("/")[-1].split("?")[0]
 
+    # ── [FIX #2] Injection des cookies Twitter dans yt-dlp ────────────────────
+    # fxtwitter/vxtwitter restent la source principale (pas besoin de cookies).
+    # yt-dlp en fallback utilise twitter_cookies.txt pour éviter le blocage cloud.
     async def fetch_api(api_url):
         try:
             async with httpx.AsyncClient(timeout=10) as c:
@@ -414,8 +384,7 @@ async def resolve_twitter(url):
 
         for v in m.get("videos", []):
             if v.get("url"):
-                thumbnail = (v.get("thumbnail_url")
-                             or _best_twitter_thumbnail(t, tid, v["url"]))
+                thumbnail = v.get("thumbnail_url") or _best_twitter_thumbnail(t, tid, v["url"])
                 result = {"success": True, "direct_url": v["url"], "title": t.get("text", "X")[:100],
                           "thumbnail": thumbnail, "duration": 0,
                           "platform": "twitter", "ext": "mp4", "is_image": False, "all_images": []}
@@ -424,8 +393,7 @@ async def resolve_twitter(url):
 
         for g in m.get("gifs", []):
             if g.get("url"):
-                thumbnail = (g.get("thumbnail_url")
-                             or _best_twitter_thumbnail(t, tid))
+                thumbnail = g.get("thumbnail_url") or _best_twitter_thumbnail(t, tid)
                 result = {"success": True, "direct_url": g["url"], "title": t.get("text", "X")[:100],
                           "thumbnail": thumbnail, "duration": 0, "platform": "twitter",
                           "ext": "mp4", "is_image": False, "all_images": []}
@@ -442,8 +410,7 @@ async def resolve_twitter(url):
 
         for me in data.get("media_extended", []):
             if me.get("type") in ["video", "gif"] and me.get("url"):
-                thumbnail = (me.get("thumbnail_url")
-                             or _best_twitter_thumbnail(t, tid))
+                thumbnail = me.get("thumbnail_url") or _best_twitter_thumbnail(t, tid)
                 result = {"success": True, "direct_url": me["url"], "title": data.get("text", "X")[:100],
                           "thumbnail": thumbnail, "duration": 0, "platform": "twitter",
                           "ext": "mp4", "is_image": False, "all_images": []}
@@ -456,15 +423,42 @@ async def resolve_twitter(url):
                 cache_set(url, result)
                 return result
 
+    # ── Fallback yt-dlp avec cookies Twitter ──────────────────────────────────
+    try:
+        opts = {
+            "quiet": True, "skip_download": True,
+            "format": "best[ext=mp4]/best",
+            "socket_timeout": 8, "retries": 1,
+            "http_headers": {"User-Agent": "Mozilla/5.0"}
+        }
+        cf = get_cookie_file("twitter")
+        if cf:
+            opts["cookiefile"] = cf  # [FIX #2] cookies Twitter injectés ici
+        info = await run_yt_dlp(opts, url)
+        ext = info.get("ext", "mp4")
+        du = info.get("url", "")
+        if not du and info.get("formats"):
+            mp4s = [f for f in info["formats"] if f.get("ext") == "mp4" and f.get("url")]
+            du = mp4s[-1]["url"] if mp4s else info["formats"][-1].get("url", "")
+        if du:
+            result = {"success": True, "direct_url": du,
+                      "title": info.get("title", "X")[:100],
+                      "thumbnail": info.get("thumbnail", ""),
+                      "duration": int(info.get("duration") or 0),
+                      "platform": "twitter", "ext": ext,
+                      "is_image": ext in ["jpg", "jpeg", "png", "webp"], "all_images": []}
+            cache_set(url, result)
+            return result
+    except Exception:
+        pass
+
     return {"success": False, "error": "Ce tweet ne contient pas de média ou est privé."}
 
 # ── Instagram ─────────────────────────────────────────────────────────────────
 async def _instagram_snapinsta(url: str) -> dict:
-    """SnapInsta scraper — API tierce légère."""
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
-            tr = await c.get("https://snapinsta.app/",
-                             headers={"User-Agent": "Mozilla/5.0"})
+            tr = await c.get("https://snapinsta.app/", headers={"User-Agent": "Mozilla/5.0"})
             m = re.search(r'name="_token"\s+value="([^"]+)"', tr.text)
             if not m:
                 return {"success": False, "error": "snapinsta token failed"}
@@ -496,17 +490,14 @@ async def _instagram_snapinsta(url: str) -> dict:
     return {"success": False, "error": "snapinsta failed"}
 
 async def _instagram_instavideosave(url: str) -> dict:
-    """instavideosave.net — API tierce rapide, parallèle à SnapInsta."""
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
             r = await c.post(
                 "https://instavideosave.net/",
                 data={"url": url},
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": "https://instavideosave.net/",
-                    "Content-Type": "application/x-www-form-urlencoded"
-                }
+                headers={"User-Agent": "Mozilla/5.0",
+                         "Referer": "https://instavideosave.net/",
+                         "Content-Type": "application/x-www-form-urlencoded"}
             )
             vids = re.findall(r'https://[^"\']+\.mp4[^"\']*', r.text)
             imgs = re.findall(r'https://[^"\']+\.jpg[^"\']*', r.text)
@@ -524,7 +515,6 @@ async def _instagram_instavideosave(url: str) -> dict:
     return {"success": False, "error": "instavideosave failed"}
 
 async def _instagram_ytdlp(url: str, extra_cookies: str = "") -> dict:
-    """yt-dlp Instagram — dernier recours, timeout serré."""
     tmp = None
     try:
         if extra_cookies:
@@ -539,10 +529,8 @@ async def _instagram_ytdlp(url: str, extra_cookies: str = "") -> dict:
         }
         if cf:
             opts["cookiefile"] = cf
-
         info = await run_yt_dlp(opts, url)
 
-        # CAS CARROUSEL
         if info.get("_type") == "playlist":
             entries = [e for e in info.get("entries", []) if e]
             valid = []
@@ -577,7 +565,6 @@ async def _instagram_ytdlp(url: str, extra_cookies: str = "") -> dict:
                     "is_image": not first["is_video"],
                     "all_images": all_images, "carousel_items": carousel_items}
 
-        # CAS SIMPLE
         ext = info.get("ext", "mp4")
         is_image = ext in ["jpg", "jpeg", "png", "webp"]
         du = info.get("url", "")
@@ -610,8 +597,6 @@ async def resolve_instagram(url, extra_cookies=""):
 
     is_story = "/stories/" in url.lower()
 
-    # ⚡ Toutes les sources en parallèle simultanément
-    # Pour les stories, yt-dlp est souvent la seule option
     if is_story:
         result = await first_success(
             _instagram_ytdlp(url, extra_cookies),
@@ -635,26 +620,21 @@ async def resolve_instagram(url, extra_cookies=""):
 
 # ── Facebook ──────────────────────────────────────────────────────────────────
 async def _facebook_getfvid(url: str) -> dict:
-    """getfvid.com — API tierce rapide pour Facebook."""
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
-            r1 = await c.get("https://www.getfvid.com/",
-                             headers={"User-Agent": "Mozilla/5.0"})
+            r1 = await c.get("https://www.getfvid.com/", headers={"User-Agent": "Mozilla/5.0"})
             token_m = re.search(r'name="_token"\s+value="([^"]+)"', r1.text)
             if not token_m:
                 return {"success": False, "error": "getfvid token failed"}
             r2 = await c.post(
                 "https://www.getfvid.com/downloader",
                 data={"url": url, "_token": token_m.group(1)},
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": "https://www.getfvid.com/",
-                    "Content-Type": "application/x-www-form-urlencoded"
-                }
+                headers={"User-Agent": "Mozilla/5.0",
+                         "Referer": "https://www.getfvid.com/",
+                         "Content-Type": "application/x-www-form-urlencoded"}
             )
             vids = re.findall(r'https://[^"\']+\.mp4[^"\']*', r2.text)
             if vids:
-                # Préférer HD si disponible
                 hd = [v for v in vids if "hd" in v.lower() or "HD" in v]
                 best = hd[0] if hd else vids[0]
                 return {"success": True, "direct_url": best, "title": "Video Facebook",
@@ -665,21 +645,18 @@ async def _facebook_getfvid(url: str) -> dict:
     return {"success": False, "error": "getfvid failed"}
 
 async def _facebook_savefrom(url: str) -> dict:
-    """SaveFrom API — autre source rapide pour Facebook."""
     try:
         async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(
-                f"https://worker.sf-tools.com/savefrom.php?sf_url={url}",
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
+            r = await c.get(f"https://worker.sf-tools.com/savefrom.php?sf_url={url}",
+                            headers={"User-Agent": "Mozilla/5.0"})
             data = r.json()
-            # SaveFrom retourne {"url": [...]}
             urls = data.get("url", [])
             if isinstance(urls, list) and urls:
                 best = urls[0]
                 video_url = best.get("url", "") if isinstance(best, dict) else str(best)
                 if video_url and ".mp4" in video_url:
-                    return {"success": True, "direct_url": video_url, "title": data.get("meta", {}).get("title", "Facebook"),
+                    return {"success": True, "direct_url": video_url,
+                            "title": data.get("meta", {}).get("title", "Facebook"),
                             "thumbnail": data.get("thumb", ""), "duration": 0,
                             "platform": "facebook", "ext": "mp4", "is_image": False, "all_images": []}
     except Exception:
@@ -687,7 +664,6 @@ async def _facebook_savefrom(url: str) -> dict:
     return {"success": False, "error": "savefrom failed"}
 
 async def _facebook_ytdlp(url: str, extra_cookies: str = "") -> dict:
-    """yt-dlp Facebook — dernier recours."""
     tmp = None
     try:
         if extra_cookies:
@@ -742,11 +718,7 @@ async def resolve_facebook(url, extra_cookies=""):
 
     is_story = "/stories/" in lower
 
-    # ⚡ getfvid + savefrom en parallèle, yt-dlp en fallback
-    result = await first_success(
-        _facebook_getfvid(url),
-        _facebook_savefrom(url)
-    )
+    result = await first_success(_facebook_getfvid(url), _facebook_savefrom(url))
     if not result.get("success"):
         result = await _facebook_ytdlp(url, extra_cookies)
 
@@ -772,31 +744,28 @@ async def resolve_video(req: ResolveRequest):
     if any(b in url.lower() for b in ["youtube.com", "youtu.be"]):
         raise HTTPException(status_code=403, detail="YouTube non supporté")
 
-    # ⚡ Timeout global de sécurité : 25s max par requête
-    try:
-        # Détecter les liens courts TikTok non résolvables depuis Render
-    short_tiktok_domains = ["vt.tiktok.com", "vm.tiktok.com"]
-    if any(d in url.lower() for d in short_tiktok_domains):
-        return {
-            "success": False,
-            "error": "LIEN_COURT_TIKTOK",
-            "short_url": True
-        }
+    # ── [FIX #1] Les liens courts TikTok sont maintenant résolus, PAS rejetés ─
+    # L'ancien bloc qui renvoyait {"error": "LIEN_COURT_TIKTOK"} a été supprimé.
+    # expand_tiktok_short_url() est appelée automatiquement dans resolve_tiktok().
 
-    if "tiktok.com" in url.lower():
+    try:
+        url_lower = url.lower()
+
+        if "tiktok.com" in url_lower:
             coro = (resolve_tiktok_story(url)
-                    if "/story/" in url.lower() or "/photo/" in url.lower()
+                    if "/story/" in url_lower or "/photo/" in url_lower
                     else resolve_tiktok(url))
-        elif any(x in url.lower() for x in ["twitter.com", "x.com", "t.co"]):
+        elif any(x in url_lower for x in ["twitter.com", "x.com", "t.co"]):
             coro = resolve_twitter(url)
-        elif "instagram.com" in url.lower():
+        elif "instagram.com" in url_lower:
             coro = resolve_instagram(url, extra_cookies=cookies)
-        elif any(x in url.lower() for x in ["facebook.com", "fb.watch", "fb.com"]):
+        elif any(x in url_lower for x in ["facebook.com", "fb.watch", "fb.com"]):
             coro = resolve_facebook(url, extra_cookies=cookies)
         else:
             cached = cache_get(url)
             if cached:
                 return cached
+
             async def _generic():
                 opts = {"quiet": True, "skip_download": True,
                         "format": "best[ext=mp4]/best", "socket_timeout": 8, "retries": 1}
@@ -818,8 +787,10 @@ async def resolve_video(req: ResolveRequest):
                     return result
                 except Exception as e:
                     return {"success": False, "error": str(e)[:200]}
+
             coro = _generic()
 
+        # ── [FIX #3] Timeout serré pour Vercel (max 25s, limite Vercel = 60s) ─
         return await asyncio.wait_for(coro, timeout=25.0)
 
     except asyncio.TimeoutError:
