@@ -386,12 +386,60 @@ async def resolve_twitter(url):
         t = data.get("tweet", data)
         m = t.get("media", {})
 
-        # ── Vidéos ────────────────────────────────────────────────────────────
+        # ── [FIX THUMBNAIL] ───────────────────────────────────────────────────
+        # fxtwitter structure RÉELLE observée dans le JSON :
+        #   tweet.media.all[]        → tableau de TOUS les médias (vidéos + photos)
+        #   tweet.media.videos[]     → souvent VIDE même quand il y a une vidéo !
+        #   tweet.media.thumbnail_url → thumbnail globale du tweet (fiable)
+        #   item.thumbnail_url        → thumbnail de chaque vidéo dans all[]
+        #
+        # Ordre de lecture : all[] en priorité, puis videos[], gifs[], photos[]
+
+        # Thumbnail globale du tweet (disponible même si all[] est vide)
+        tweet_thumbnail = m.get("thumbnail_url", "") or t.get("thumbnail_url", "")
+
+        # ── 1. Lire tweet.media.all[] (structure principale fxtwitter) ─────────
+        for item in m.get("all", []):
+            item_url  = item.get("url", "")
+            item_type = item.get("type", "")
+            if not item_url:
+                continue
+
+            if item_type in ["video", "gif"]:
+                # thumbnail : d'abord sur l'item, sinon la thumbnail globale du tweet
+                thumbnail = (item.get("thumbnail_url", "")
+                             or tweet_thumbnail
+                             or t.get("author", {}).get("avatar_url", ""))
+                result = {
+                    "success": True, "direct_url": item_url,
+                    "title": t.get("text", "X")[:100],
+                    "thumbnail": thumbnail,
+                    "duration": int(item.get("duration", 0) or 0),
+                    "platform": "twitter", "ext": "mp4", "is_image": False, "all_images": []
+                }
+                cache_set(url, result)
+                return result
+
+            if item_type == "photo":
+                thumbnail = item_url  # la photo est sa propre thumbnail
+                result = {
+                    "success": True, "direct_url": item_url,
+                    "title": t.get("text", "X")[:100],
+                    "thumbnail": thumbnail,
+                    "duration": 0,
+                    "platform": "twitter", "ext": "jpg", "is_image": True, "all_images": []
+                }
+                cache_set(url, result)
+                return result
+
+        # ── 2. Fallback : tweet.media.videos[] (ancienne structure) ────────────
         for v in m.get("videos", []):
             video_url = v.get("url", "")
             if not video_url:
                 continue
-            thumbnail = _get_twitter_thumbnail(v, t, tid)
+            thumbnail = (v.get("thumbnail_url", "")
+                         or tweet_thumbnail
+                         or _get_twitter_thumbnail(v, t, tid))
             result = {
                 "success": True, "direct_url": video_url,
                 "title": t.get("text", "X")[:100],
@@ -402,12 +450,14 @@ async def resolve_twitter(url):
             cache_set(url, result)
             return result
 
-        # ── GIFs ──────────────────────────────────────────────────────────────
+        # ── 3. Fallback : tweet.media.gifs[] ───────────────────────────────────
         for g in m.get("gifs", []):
             gif_url = g.get("url", "")
             if not gif_url:
                 continue
-            thumbnail = _get_twitter_thumbnail(g, t, tid)
+            thumbnail = (g.get("thumbnail_url", "")
+                         or tweet_thumbnail
+                         or _get_twitter_thumbnail(g, t, tid))
             result = {
                 "success": True, "direct_url": gif_url,
                 "title": t.get("text", "X")[:100],
@@ -418,7 +468,7 @@ async def resolve_twitter(url):
             cache_set(url, result)
             return result
 
-        # ── Photos ────────────────────────────────────────────────────────────
+        # ── 4. Fallback : tweet.media.photos[] ─────────────────────────────────
         for p in m.get("photos", []):
             photo_url = p.get("url", "")
             if not photo_url:
@@ -433,13 +483,15 @@ async def resolve_twitter(url):
             cache_set(url, result)
             return result
 
-        # ── media_extended (vxtwitter) ────────────────────────────────────────
+        # ── 5. Fallback : media_extended (vxtwitter) ───────────────────────────
         for me in data.get("media_extended", []):
             me_url = me.get("url", "")
             if not me_url:
                 continue
             if me.get("type") in ["video", "gif"]:
-                thumbnail = _get_twitter_thumbnail(me, t, tid)
+                thumbnail = (me.get("thumbnail_url", "")
+                             or tweet_thumbnail
+                             or _get_twitter_thumbnail(me, t, tid))
                 result = {
                     "success": True, "direct_url": me_url,
                     "title": data.get("text", "X")[:100],
